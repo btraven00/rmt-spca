@@ -1,0 +1,14 @@
+[package]
+name = "rmt-spca"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+faer = "0.19"
+rayon = "1.10"
+ndarray = { version = "0.16", features = ["rayon"] }
+num-traits = "0.2"
+statrs = "0.18"
+
+[dev-dependencies]
+criterion = "0.5"
