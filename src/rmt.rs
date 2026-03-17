@@ -1,34 +1,73 @@
-/// Random Matrix Theory helpers for biwhitened scRNA-seq data.
+/// Random Matrix Theory quantities for biwhitened scRNA-seq data.
+///
+/// All formulas follow Chardès et al., "A statistical physics approach to
+/// characterise single-cell data" (2023), hereafter "the paper".
+///
+/// The central assumption is that after biwhitening the count matrix X,
+/// the noise part of the sample covariance S = X_w^T X_w / n converges to
+/// a Marchenko-Pastur (MP) distribution with aspect ratio q = p/n as
+/// n, p → ∞ (Section 2.1, Eq. 2).  Signal components appear as outlier
+/// eigenvalues above the bulk edge λ+ via the BBP phase transition.
 pub struct RmtTheory {
-    pub q: f64, // p/n (genes / cells)
+    /// Aspect ratio q = p/n (genes / cells).
+    pub q: f64,
 }
 
 impl RmtTheory {
-    /// Upper edge of the Marchenko-Pastur bulk [cite: 87, 152]
+    /// Upper edge of the Marchenko-Pastur bulk spectrum.
+    ///
+    /// λ+ = (1 + √q)²  (Eq. 3 in the paper).
+    ///
+    /// Eigenvalues of S above λ+ are "outliers" that correspond to genuine
+    /// biological signal components (BBP phase transition, Section 2.2).
     pub fn lambda_plus(&self) -> f64 {
         (1.0 + self.q.sqrt()).powi(2)
     }
 
-    /// Lower edge of the Marchenko-Pastur bulk
+    /// Lower edge of the Marchenko-Pastur bulk spectrum.
+    ///
+    /// λ- = (1 - √q)²  (Eq. 3).
     pub fn lambda_minus(&self) -> f64 {
         (1.0 - self.q.sqrt()).powi(2)
     }
 
-    /// Predicted squared cosine overlap of an outlier eigenvector with the true signal [cite: 156, 382]
+    /// Predicted squared cosine overlap between an outlier eigenvector and
+    /// the true signal direction.
+    ///
+    /// For an observed outlier eigenvalue λ > λ+, the BBP formula gives
+    /// (Eq. 9 in the paper):
+    ///
+    ///   cos²θ = [ (α−1)² − q ] / [ (α−1)(α−1+q) ]
+    ///
+    /// where α is the underlying signal eigenvalue recovered via
+    /// `calculate_alpha`.  A value near 1 means the empirical eigenvector
+    /// is a reliable estimate of the true signal direction.
     pub fn predicted_overlap(&self, lambda: f64) -> f64 {
         let alpha = self.calculate_alpha(lambda);
         ((alpha - 1.0).powi(2) - self.q) / ((alpha - 1.0) * (alpha - 1.0 + self.q))
     }
 
-    /// Inverse BBP map: recover signal eigenvalue alpha from observed outlier lambda [cite: 387, 391]
-    /// lambda = alpha + q * alpha/(alpha-1)  =>  alpha^2 - (lambda+1-q)*alpha + lambda = 0
+    /// Inverse BBP map: recover the signal eigenvalue α from the observed
+    /// outlier eigenvalue λ.
+    ///
+    /// The BBP forward map is (Eq. 8):
+    ///   λ = α + q·α/(α−1)
+    ///
+    /// Rearranging: α² − (λ+1−q)·α + λ = 0, solved by the quadratic formula
+    /// (taking the larger root, which corresponds to α > 1 + √q).
     fn calculate_alpha(&self, lambda: f64) -> f64 {
         let b = -(lambda + 1.0 - self.q);
         let disc = b * b - 4.0 * lambda;
         (-b + disc.max(0.0).sqrt()) / 2.0
     }
 
-    /// Marchenko-Pastur density at x
+    /// Marchenko-Pastur probability density at x.
+    ///
+    /// For λ- < x < λ+ (Eq. 2):
+    ///
+    ///   ρ_MP(x) = √[(λ+−x)(x−λ-)] / (2π q x)
+    ///
+    /// Zero outside the support [λ-, λ+].
     pub fn mp_pdf(&self, x: f64) -> f64 {
         let lp = self.lambda_plus();
         let lm = self.lambda_minus();
@@ -38,7 +77,28 @@ impl RmtTheory {
         ((lp - x) * (x - lm)).sqrt() / (2.0 * std::f64::consts::PI * self.q * x)
     }
 
-    /// Marchenko-Pastur CDF via composite Simpson's rule (2000 panels, even)
+    /// Median of the Marchenko-Pastur distribution.
+    ///
+    /// Found by binary search on `mp_cdf`.  Used in the biwhitening
+    /// post-convergence normalisation (Algorithm 1, final step).
+    pub fn mp_median(&self) -> f64 {
+        let lm = self.lambda_minus();
+        let lp = self.lambda_plus();
+        let mut lo = lm + 1e-9;
+        let mut hi = lp - 1e-9;
+        for _ in 0..60 {
+            let mid = (lo + hi) / 2.0;
+            if self.mp_cdf(mid) < 0.5 { lo = mid; } else { hi = mid; }
+        }
+        (lo + hi) / 2.0
+    }
+
+    /// Marchenko-Pastur cumulative distribution function at x.
+    ///
+    /// Computed by composite Simpson's rule (2000 panels) over [λ-, x].
+    /// Used in the KS goodness-of-fit test to check that the bulk
+    /// eigenspectrum of S is consistent with pure noise (Section 3.1 of
+    /// Chardès et al., arXiv:2509.15429).
     pub fn mp_cdf(&self, x: f64) -> f64 {
         let lm = self.lambda_minus();
         let lp = self.lambda_plus();

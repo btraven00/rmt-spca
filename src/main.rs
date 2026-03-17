@@ -49,6 +49,7 @@ fn main() {
         lambda: 0.05,
         max_iterations: 500,
         tolerance: 1e-7,
+        ..FistaConfig::default()
     };
     let spca = SparsePCA::new(config);
     let result = spca.fit(&x);
