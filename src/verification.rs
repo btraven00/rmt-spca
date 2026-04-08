@@ -12,8 +12,15 @@ use crate::rmt::RmtTheory;
 /// - Eigenvalues **above** λ+ (BBP signal outliers — not noise)
 /// - Eigenvalues **≤ 0.001** (zero-spike from structural zeros / unexpressed genes)
 ///
+/// Uses `mp_cdf_bulk` (the conditional CDF normalised to [0, 1] over [λ-, λ+])
+/// rather than the full `mp_cdf`, matching Python's `score()` method which
+/// normalises the MP density by its total integral before calling `kstest` on
+/// non-zero eigenvalues.  For q > 1, `mp_cdf` would have a point mass of
+/// (1 − 1/q) below λ-, so the empirical and theoretical CDFs would be offset
+/// by that amount; `mp_cdf_bulk` removes this offset.
+///
 /// The two-sided ECDF statistic is computed:
-///   KS = max_i  max( |F_i^right − F_MP(λ_i)|, |F_i^left − F_MP(λ_i)| )
+///   KS = max_i  max( |F_i^right − F_bulk(λ_i)|, |F_i^left − F_bulk(λ_i)| )
 ///
 /// where F_i^right = i/m, F_i^left = (i−1)/m are the right and left limits
 /// of the empirical CDF at the i-th sorted eigenvalue.
@@ -33,7 +40,9 @@ pub fn calculate_bulk_ks(eigenvalues: &[f64], q: f64) -> f64 {
 
     let mut ks = 0.0_f64;
     for (i, &val) in bulk.iter().enumerate() {
-        let f_theory = rmt.mp_cdf(val);
+        // mp_cdf_bulk: conditional CDF normalised to [0,1] over non-zero support.
+        // Matches Python BiwhitenedCovarianceEstimator._get_cdf() normalisation.
+        let f_theory = rmt.mp_cdf_bulk(val);
         let f_right = (i + 1) as f64 / m as f64;
         let f_left = i as f64 / m as f64;
         ks = ks.max((f_right - f_theory).abs());
@@ -68,14 +77,11 @@ pub fn verify_mp_fit(eigenvalues: &[f64], p: usize, n: usize) -> f64 {
 mod tests {
     use super::*;
 
-    #[test]
-    fn pure_noise_small_ks() {
-        // Eigenvalues of a Wishart matrix (p=10, n=100) should follow MP closely.
-        // Approximate with 30 quantile-spaced values from the MP CDF as a
-        // self-consistency smoke test.
-        let rmt = crate::rmt::RmtTheory { q: 10.0 / 100.0 };
-        let m = 30;
-        let eigenvalues: Vec<f64> = (1..=m)
+    /// Generate quantile-spaced eigenvalues from mp_cdf_bulk (the conditional
+    /// CDF normalised to [0, 1]).  These perfectly follow the bulk distribution,
+    /// so calculate_bulk_ks should return a near-zero KS statistic.
+    fn mp_bulk_quantiles(rmt: &crate::rmt::RmtTheory, m: usize) -> Vec<f64> {
+        (1..=m)
             .map(|i| {
                 let target = i as f64 / (m + 1) as f64;
                 let lm = rmt.lambda_minus();
@@ -84,13 +90,35 @@ mod tests {
                 let mut hi = lp - 1e-9;
                 for _ in 0..60 {
                     let mid = (lo + hi) / 2.0;
-                    if rmt.mp_cdf(mid) < target { lo = mid; } else { hi = mid; }
+                    if rmt.mp_cdf_bulk(mid) < target { lo = mid; } else { hi = mid; }
                 }
                 (lo + hi) / 2.0
             })
-            .collect();
+            .collect()
+    }
 
-        let ks = verify_mp_fit(&eigenvalues, 10, 100);
-        assert!(ks < 0.05, "KS = {ks}");
+    // Python reference: scipy.stats.kstest(eigs_bulk, _get_cdf()) ≈ 0 when
+    // eigenvalues are drawn from the MP distribution.  Test for q < 1 and q > 1.
+    #[test]
+    fn pure_noise_small_ks_q_lt_1() {
+        // q = 0.1 (p=10, n=100): standard case, mp_cdf_bulk == mp_cdf.
+        let rmt = crate::rmt::RmtTheory { q: 10.0 / 100.0 };
+        let eigenvalues = mp_bulk_quantiles(&rmt, 30);
+        let ks = calculate_bulk_ks(&eigenvalues, rmt.q);
+        assert!(ks < 0.05, "KS (q=0.1) = {ks}");
+    }
+
+    // Python reference: same test but for q > 1 (p > n), the common case in
+    // scRNA-seq.  Before the mp_cdf_bulk fix, calculate_bulk_ks would return
+    // KS ≈ (1 − 1/q) because it compared bulk eigenvalues (empirical CDF: 0→1)
+    // against mp_cdf (theoretical CDF: (1−1/q)→1), producing a constant offset.
+    #[test]
+    fn pure_noise_small_ks_q_gt_1() {
+        for &q in &[2.0_f64, 5.0, 10.0] {
+            let rmt = crate::rmt::RmtTheory { q };
+            let eigenvalues = mp_bulk_quantiles(&rmt, 50);
+            let ks = calculate_bulk_ks(&eigenvalues, q);
+            assert!(ks < 0.05, "KS (q={q}) = {ks}");
+        }
     }
 }

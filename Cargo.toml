@@ -12,3 +12,7 @@ statrs = "0.18"
 
 [dev-dependencies]
 criterion = "0.5"
+
+[[bench]]
+name = "pipeline"
+harness = false
