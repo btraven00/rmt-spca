@@ -76,9 +76,9 @@ fn synthetic_scrna(n: usize, p: usize, k_sig: usize, snr: f64, seed: u64) -> Mat
 }
 
 fn sample_covariance(x: &Mat<f64>) -> Mat<f64> {
-    let inv_n = 1.0 / x.nrows() as f64;
+    let inv = 1.0 / (x.nrows() - 1) as f64;
     let s: Mat<f64> = x.as_ref().transpose() * x.as_ref();
-    Mat::from_fn(s.nrows(), s.ncols(), |i, j| s.read(i, j) * inv_n)
+    Mat::from_fn(s.nrows(), s.ncols(), |i, j| s.read(i, j) * inv)
 }
 
 // ---------------------------------------------------------------------------
@@ -108,7 +108,7 @@ fn bench_covariance(c: &mut Criterion) {
     for &(n, p) in &[(500, 2_000), (1_000, 5_000), (3_000, 10_000)] {
         let data = synthetic_scrna(n, p, 3, 2.0, 42);
         let bw = Biwhitener::default();
-        let (cv, d, _) = bw.compute(&data);
+        let (cv, d, _, _, _) = bw.compute(&data);
         let xw = Biwhitener::apply(&data, &cv, &d);
         group.bench_with_input(
             BenchmarkId::new("XtX/n", format!("{n}x{p}")),

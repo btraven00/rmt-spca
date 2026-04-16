@@ -1083,6 +1083,8 @@ dependencies = [
  "ndarray",
  "num-traits",
  "rayon",
+ "serde",
+ "serde_json",
  "statrs",
 ]
 

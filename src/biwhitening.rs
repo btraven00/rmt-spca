@@ -6,12 +6,12 @@ use faer::{Col, Mat};
 /// that the rescaled matrix X_w = diag(c) X diag(d) satisfies the
 /// biwhitening conditions (Section 2.3, Eq. 6):
 ///
-///   (1/p) Σⱼ (X_w)²ᵢⱼ = 1  for all cells i     (unit per-cell second moment)
-///   (1/n) Σᵢ (X_w)²ᵢⱼ = 1  for all genes j     (unit per-gene second moment)
+///   Var_i(X_w)_j = 1  for all genes j   (unit per-gene variance across cells)
+///   Var_j(X_w)_i = 1  for all cells i   (unit per-cell variance across genes)
 ///
-/// This is equivalent to normalising S = X_w^T X_w / n so that its diagonal
-/// entries are all 1, which places the noise eigenspectrum in the support of
-/// the standard Marchenko-Pastur distribution (mean eigenvalue = 1).
+/// Note: the update targets unit *variance*, not unit second moment.  For
+/// non-centred data the second moment is 1 + μ² where μ is the column/row
+/// mean.  After mean-centring in the pipeline (Stage 2), the two coincide.
 ///
 /// **Input should be non-negative** (raw counts or log-normalised counts
 /// before mean-centring).  Centre the output afterward for the covariance
