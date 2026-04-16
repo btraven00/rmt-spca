@@ -2,12 +2,22 @@
 name = "rmt-spca"
 version = "0.1.0"
 edition = "2021"
+description = "RMT-guided Sparse PCA for single-cell RNA-seq: biwhitening, Marchenko-Pastur thresholding, and FISTA sparse components"
+license = "GPL-3.0-only"
+repository = "https://github.com/btraven00/rmt-spca"
+keywords = ["single-cell", "sparse-pca", "random-matrix-theory", "bioinformatics", "rna-seq"]
+categories = ["science", "mathematics", "algorithms"]
+readme = "README.md"
+exclude = [
+    "test_vectors/",
+    "scripts/",
+    "docs/",
+    "examples/check_parallelism.rs",
+]
 
 [dependencies]
 faer = { version = "0.19", features = ["rayon"] }
 rayon = "1.10"
-ndarray = { version = "0.16", features = ["rayon"] }
-num-traits = "0.2"
 statrs = "0.18"
 
 [dev-dependencies]

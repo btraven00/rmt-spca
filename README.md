@@ -5,7 +5,7 @@ Rust implementation of RMT-guided Sparse PCA for single-cell RNA-seq, following
 
 This crate is the core algorithm library.  For file I/O (`.h5ad`), log-normalisation,
 UMAP plotting, and a ready-to-use CLI, see the companion crate
-[`rmt-spca-io`](../rmt-spca-io).
+[`rmt-spca-io`](rmt-spca-io).
 
 ## Quick start (library)
 

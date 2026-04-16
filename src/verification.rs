@@ -53,9 +53,11 @@ pub fn calculate_bulk_ks(eigenvalues: &[f64], q: f64) -> f64 {
 
 /// KS distance between the **full** empirical eigenspectrum and the MP CDF.
 ///
-/// Unlike `calculate_bulk_ks`, this includes all eigenvalues (signal outliers
-/// and zero-spike).  Kept for reference; prefer `calculate_bulk_ks` for
-/// validating biwhitening quality.
+/// Unlike [`calculate_bulk_ks`], this includes all eigenvalues (signal outliers
+/// and zero-spike).  Prefer [`calculate_bulk_ks`] for validating biwhitening
+/// quality; this function is retained for compatibility.
+#[deprecated(since = "0.1.0", note = "use `calculate_bulk_ks` instead, which \
+    filters to the bulk range and uses the correctly normalised bulk CDF")]
 pub fn verify_mp_fit(eigenvalues: &[f64], p: usize, n: usize) -> f64 {
     let rmt = RmtTheory { q: p as f64 / n as f64 };
     let mut sorted = eigenvalues.to_vec();

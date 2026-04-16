@@ -147,7 +147,7 @@ impl Biwhitener {
         (c, d, iters, false, last_res)
     }
 
-    /// Apply scalings: returns X_w where X_w[i,j] = c[i] · x[i,j] · d[j].
+    /// Apply scalings: returns X_w where `X_w\[i,j\] = c\[i\] · x\[i,j\] · d\[j\]`.
     ///
     /// This is the matrix diag(c) X diag(d) from Algorithm 1, line 10.
     pub fn apply(x: &Mat<f64>, c: &Col<f64>, d: &Col<f64>) -> Mat<f64> {

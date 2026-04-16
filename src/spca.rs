@@ -105,11 +105,15 @@ impl Default for FistaConfig {
     }
 }
 
+/// The Sparse PCA pipeline runner.
+///
+/// Construct with [`SparsePCA::new`] and call [`SparsePCA::fit`].
 pub struct SparsePCA {
     config: FistaConfig,
 }
 
 impl SparsePCA {
+    /// Create a new pipeline runner with the given configuration.
     pub fn new(config: FistaConfig) -> Self {
         Self { config }
     }
@@ -426,7 +430,7 @@ pub struct SparsePCAResult {
 /// Stops when either the iterate change ‖W_{t+1}−W_t‖_F < `tol` **or** the
 /// relative objective change falls below `tol_obj` (OR criterion prevents
 /// getting stuck when rotational ambiguity keeps ‖ΔW‖ large).
-pub fn fista_sparse_pca(
+pub(crate) fn fista_sparse_pca(
     s: &Mat<f64>,
     v_init: &Mat<f64>,
     gamma: f64,
