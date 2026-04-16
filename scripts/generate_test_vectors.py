@@ -10,8 +10,22 @@
 Generate test vectors from the Python reference implementation for cross-validation
 with the Rust rmt-spca crate.
 
-The reference functions are copied verbatim from ../spcarmt/scrna/rmt/ to avoid
-importing the full package (which pulls in scanpy, rpy2, sklearn, etc.).
+The reference functions below are copied verbatim (or with trivial adaptation)
+from the spcarmt package by Victor Chardès, used here under the MIT License:
+
+    MIT License
+    Copyright (c) 2025 Victor Chardès
+    https://github.com/victorchrd/spcarmt  (../spcarmt relative to this file)
+
+Source files copied from:
+  - ../spcarmt/scrna/rmt/_covariance.py
+      marchenko_pastur_density, marchenko_pastur_cumulative,
+      marchenko_pastur_median, biwhitening
+  - ../spcarmt/scrna/rmt/_toy.py
+      predicted_overlap, predicted_eigval, invert_predicted_eigval
+
+No modifications were made to the mathematical logic; only imports and
+class-method references were removed to make the functions self-contained.
 
 Usage:
     cd /home/b/phd/rmt-spca
@@ -29,6 +43,7 @@ os.makedirs(OUT, exist_ok=True)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Reference functions — copied from ../spcarmt/scrna/rmt/_covariance.py
+# Copyright (c) 2025 Victor Chardès, MIT License
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def marchenko_pastur_density(x, q):
@@ -61,6 +76,7 @@ def marchenko_pastur_median(q):
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Reference functions — copied from ../spcarmt/scrna/rmt/_toy.py
+# Copyright (c) 2025 Victor Chardès, MIT License
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def predicted_overlap(pop_spike, gamma, s2=1):
@@ -80,6 +96,9 @@ def invert_predicted_eigval(sample_spike, gamma, s2=1):
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Reference biwhitening — copied from ../spcarmt/scrna/rmt/_covariance.py
+# Copyright (c) 2025 Victor Chardès, MIT License
+# Note: alpha rescaling (D1/sqrt(alpha)) is omitted intentionally — we want
+# the raw biwhitened matrix for fixed-point testing, not the MP-scaled version.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def biwhitening(X, max_iter=1000, vperiod=5, tol=1e-5):
