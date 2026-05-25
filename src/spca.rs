@@ -378,6 +378,7 @@ impl SparsePCA {
         SparsePCAResult {
             components, eigenvalues, s_eigenvalues,
             lambda_plus, q: rmt.q, sigma_sq, ks_distance,
+            sk_iters: bw_iters, sk_converged: bw_ok, sk_residual: bw_res,
         }
     }
 }
@@ -408,6 +409,12 @@ pub struct SparsePCAResult {
     /// Marchenko-Pastur CDF.  `None` if `compute_ks = false` or
     /// `EigensolverMode::Fast` was used.
     pub ks_distance: Option<f64>,
+    /// Number of Sinkhorn-Knopp iterations executed during biwhitening.
+    pub sk_iters: usize,
+    /// Whether Sinkhorn-Knopp reached its convergence tolerance.
+    pub sk_converged: bool,
+    /// Final 95th-percentile relative change in c at the last SK iteration.
+    pub sk_residual: f64,
 }
 
 // ---------------------------------------------------------------------------
