@@ -36,7 +36,9 @@ pub fn calculate_bulk_ks(eigenvalues: &[f64], q: f64) -> f64 {
     bulk.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
     let m = bulk.len();
-    if m == 0 { return 0.0; }
+    if m == 0 {
+        return 0.0;
+    }
 
     let mut ks = 0.0_f64;
     for (i, &val) in bulk.iter().enumerate() {
@@ -56,10 +58,15 @@ pub fn calculate_bulk_ks(eigenvalues: &[f64], q: f64) -> f64 {
 /// Unlike [`calculate_bulk_ks`], this includes all eigenvalues (signal outliers
 /// and zero-spike).  Prefer [`calculate_bulk_ks`] for validating biwhitening
 /// quality; this function is retained for compatibility.
-#[deprecated(since = "0.1.0", note = "use `calculate_bulk_ks` instead, which \
-    filters to the bulk range and uses the correctly normalised bulk CDF")]
+#[deprecated(
+    since = "0.1.0",
+    note = "use `calculate_bulk_ks` instead, which \
+    filters to the bulk range and uses the correctly normalised bulk CDF"
+)]
 pub fn verify_mp_fit(eigenvalues: &[f64], p: usize, n: usize) -> f64 {
-    let rmt = RmtTheory { q: p as f64 / n as f64 };
+    let rmt = RmtTheory {
+        q: p as f64 / n as f64,
+    };
     let mut sorted = eigenvalues.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let m = sorted.len();
@@ -92,7 +99,11 @@ mod tests {
                 let mut hi = lp - 1e-9;
                 for _ in 0..60 {
                     let mid = (lo + hi) / 2.0;
-                    if rmt.mp_cdf_bulk(mid) < target { lo = mid; } else { hi = mid; }
+                    if rmt.mp_cdf_bulk(mid) < target {
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
                 }
                 (lo + hi) / 2.0
             })

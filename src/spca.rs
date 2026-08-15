@@ -214,16 +214,34 @@ impl SparsePCA {
         // P2.A path: if precomputed factors were provided in the config, use
         // them directly and skip Sinkhorn-Knopp.  Caller is responsible for
         // shape-matching to the (post-filter) (n, p) — we assert it here.
-        if v { eprint!("[biwhitening]  {n}×{p} matrix ... "); }
+        if v {
+            eprint!("[biwhitening]  {n}×{p} matrix ... ");
+        }
         let t = Instant::now();
-        let bw = Biwhitener { max_iter: self.config.bw_max_iter, damp: self.config.bw_damp, ..Biwhitener::default() };
+        let bw = Biwhitener {
+            max_iter: self.config.bw_max_iter,
+            damp: self.config.bw_damp,
+            ..Biwhitener::default()
+        };
         let (c, d, bw_iters, bw_ok, bw_res) = match &self.config.precomputed_factors {
             Some((c_in, d_in)) => {
-                assert_eq!(c_in.nrows(), n,
-                    "precomputed_factors c length {} != n {} (after zero-row/col filter)", c_in.nrows(), n);
-                assert_eq!(d_in.nrows(), p,
-                    "precomputed_factors d length {} != p {} (after zero-row/col filter)", d_in.nrows(), p);
-                if v { eprint!("[precomputed factors, skip Sinkhorn-Knopp] "); }
+                assert_eq!(
+                    c_in.nrows(),
+                    n,
+                    "precomputed_factors c length {} != n {} (after zero-row/col filter)",
+                    c_in.nrows(),
+                    n
+                );
+                assert_eq!(
+                    d_in.nrows(),
+                    p,
+                    "precomputed_factors d length {} != p {} (after zero-row/col filter)",
+                    d_in.nrows(),
+                    p
+                );
+                if v {
+                    eprint!("[precomputed factors, skip Sinkhorn-Knopp] ");
+                }
                 (c_in.clone(), d_in.clone(), 0_usize, true, 0.0_f64)
             }
             None => bw.compute(data),
@@ -241,7 +259,10 @@ impl SparsePCA {
             let col_vars: Vec<f64> = (0..p)
                 .map(|j| {
                     let mean = (0..n).map(|i| data.read(i, j)).sum::<f64>() / n as f64;
-                    let var = (0..n).map(|i| (data.read(i, j) - mean).powi(2)).sum::<f64>() / n as f64;
+                    let var = (0..n)
+                        .map(|i| (data.read(i, j) - mean).powi(2))
+                        .sum::<f64>()
+                        / n as f64;
                     var.sqrt().max(1e-10)
                 })
                 .collect();
@@ -249,16 +270,21 @@ impl SparsePCA {
         } else {
             if v {
                 if bw_ok {
-                    eprintln!("converged in {bw_iters} iters ({:.2}s)", t.elapsed().as_secs_f64());
+                    eprintln!(
+                        "converged in {bw_iters} iters ({:.2}s)",
+                        t.elapsed().as_secs_f64()
+                    );
                 } else if bw_iters < bw.max_iter {
                     eprintln!(
                         "stagnated at iter {bw_iters}/{} residual={bw_res:.2e} ({:.2}s)",
-                        bw.max_iter, t.elapsed().as_secs_f64()
+                        bw.max_iter,
+                        t.elapsed().as_secs_f64()
                     );
                 } else {
                     eprintln!(
                         "WARNING: hit max_iter={}, residual={bw_res:.2e} ({:.2}s)",
-                        bw.max_iter, t.elapsed().as_secs_f64()
+                        bw.max_iter,
+                        t.elapsed().as_secs_f64()
                     );
                 }
             }
@@ -275,10 +301,14 @@ impl SparsePCA {
 
         // --- Stage 3: Sample covariance ---
         // S = X_wc^T X_wc / (n-1)  (unbiased estimator, matches Python reference).
-        if v { eprint!("[covariance]   Xᵀ X / (n-1)  ({p}×{p}) ... "); }
+        if v {
+            eprint!("[covariance]   Xᵀ X / (n-1)  ({p}×{p}) ... ");
+        }
         let t = Instant::now();
         let s = sample_covariance(&xwc);
-        if v { eprint!("done ({:.2}s)  ", t.elapsed().as_secs_f64()); }
+        if v {
+            eprint!("done ({:.2}s)  ", t.elapsed().as_secs_f64());
+        }
 
         // --- Stage 4 / 4b: σ² estimation and eigenspectrum ---
         //
@@ -289,7 +319,9 @@ impl SparsePCA {
         //
         // Fast: O(p) trace estimator → approximate σ², no KS diagnostic.
         //   See `EigensolverMode::Fast` documentation for bias analysis.
-        let rmt_pre = RmtTheory { q: p as f64 / n as f64 };
+        let rmt_pre = RmtTheory {
+            q: p as f64 / n as f64,
+        };
 
         // P2.B: capture the top-K eigenvectors when running Full EVD. faer's
         // SelfAdjointEigendecomposition returns eigenvalues sorted ascending
@@ -300,7 +332,9 @@ impl SparsePCA {
 
         let (sigma_sq, s_eigenvalues): (f64, Vec<f64>) = match self.config.eigensolver {
             EigensolverMode::Full => {
-                if v { eprint!("[eigenspectrum] full EVD ({p}×{p}) ... "); }
+                if v {
+                    eprint!("[eigenspectrum] full EVD ({p}×{p}) ... ");
+                }
                 let t = Instant::now();
                 let evd = SelfAdjointEigendecomposition::new(s.as_ref(), Side::Lower);
                 let raw_eigs: Vec<f64> = (0..p).map(|i| evd.s().column_vector().read(i)).collect();
@@ -313,18 +347,24 @@ impl SparsePCA {
                         top_eigenvectors.push(col);
                     }
                 }
-                if v { eprint!("done ({:.2}s)  ", t.elapsed().as_secs_f64()); }
+                if v {
+                    eprint!("done ({:.2}s)  ", t.elapsed().as_secs_f64());
+                }
 
                 let lambda_med_mp = rmt_pre.mp_median();
                 let lplus_pre = rmt_pre.lambda_plus();
-                let mut bulk_eigs: Vec<f64> = raw_eigs.iter().cloned()
+                let mut bulk_eigs: Vec<f64> = raw_eigs
+                    .iter()
+                    .cloned()
                     .filter(|&e| e > 0.001 && e <= lplus_pre)
                     .collect();
                 bulk_eigs.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
                 let sq = if !bulk_eigs.is_empty() {
                     let l_med = bulk_eigs[bulk_eigs.len() / 2];
                     l_med / lambda_med_mp
-                } else { 1.0 };
+                } else {
+                    1.0
+                };
                 (sq, raw_eigs)
             }
             EigensolverMode::Fast => {
@@ -333,7 +373,9 @@ impl SparsePCA {
                 // Dividing by the matrix rank (min(n-1, p)) gives the mean eigenvalue,
                 // which equals σ² for pure MP noise.  Signal outliers inflate this by
                 // k×(λ̄_signal − σ²)/p_eff — see EigensolverMode::Fast docs for analysis.
-                if v { eprint!("[normalisation] Fast σ² from Tr(S) ... "); }
+                if v {
+                    eprint!("[normalisation] Fast σ² from Tr(S) ... ");
+                }
                 let t = Instant::now();
                 // Tr(S) = Σⱼ S_jj ≈ p·σ² for any aspect ratio q = p/n.
                 // For q ≤ 1: all p eigenvalues are non-zero and each ≈ σ².
@@ -344,15 +386,22 @@ impl SparsePCA {
                 //   p gives σ² × n/(n-1) ≈ σ².  Using p (not rank = n-1) is correct.
                 let trace: f64 = (0..p).map(|i| s.read(i, i)).sum();
                 let sq = trace / p as f64;
-                if v { eprint!("done ({:.4}s)  ", t.elapsed().as_secs_f64()); }
+                if v {
+                    eprint!("done ({:.4}s)  ", t.elapsed().as_secs_f64());
+                }
                 (sq, vec![])
             }
         };
 
         if v && (sigma_sq - 1.0).abs() > 1e-3 {
-            eprintln!("[normalisation] σ² = {sigma_sq:.4}{}",
-                if self.config.eigensolver == EigensolverMode::Fast { "  ⚠️  (fast/approximate)" }
-                else { "  (bulk median / MP median)" });
+            eprintln!(
+                "[normalisation] σ² = {sigma_sq:.4}{}",
+                if self.config.eigensolver == EigensolverMode::Fast {
+                    "  ⚠️  (fast/approximate)"
+                } else {
+                    "  (bulk median / MP median)"
+                }
+            );
         } else if v {
             eprintln!("[normalisation] σ² = {sigma_sq:.4}  (≈1, scale already correct)");
         }
@@ -370,9 +419,11 @@ impl SparsePCA {
         // Rayleigh quotients rq_j = v_j^T S v_j approximate the eigenvalues
         // without a full O(p³) decomposition.
         let k_max = self.config.k_max.min(p).min(n);
-        if v { eprint!("[RMT/subspace] subspace iteration (k_max={k_max}) ... "); }
+        if v {
+            eprint!("[RMT/subspace] subspace iteration (k_max={k_max}) ... ");
+        }
         let t = Instant::now();
-        let rmt = rmt_pre;  // reuse — same q = p/n
+        let rmt = rmt_pre; // reuse — same q = p/n
         let lambda_plus = rmt.lambda_plus();
         let v_cand = subspace_iteration(&s, k_max, 100);
         // Rayleigh quotients  rq_j = v_j^T S v_j
@@ -411,14 +462,20 @@ impl SparsePCA {
         // Lipschitz constant of ∇Tr(W^T S W) is L = 2·λ_max.  The Python
         // implementation uses half this value (a conservative choice that
         // still guarantees convergence).  We match Python for reproducibility.
-        let gamma = if lmax > 1e-14 { 0.5 / (2.0 * lmax) } else { 0.25 };
+        let gamma = if lmax > 1e-14 {
+            0.5 / (2.0 * lmax)
+        } else {
+            0.25
+        };
         let lambda = match self.config.lambda_frac {
             Some(frac) => frac * lambda_plus,
             None => self.config.lambda,
         };
-        if v { eprintln!("[FISTA]        λ = {lambda:.4e}  γ = {gamma:.4e}  (γλ = {:.4e})  max_iter = {}  tol = {}  tol_obj = {}",
+        if v {
+            eprintln!("[FISTA]        λ = {lambda:.4e}  γ = {gamma:.4e}  (γλ = {:.4e})  max_iter = {}  tol = {}  tol_obj = {}",
             gamma * lambda, self.config.max_iterations,
-            self.config.tolerance, self.config.tol_obj); }
+            self.config.tolerance, self.config.tol_obj);
+        }
         let t = Instant::now();
         let components = fista_sparse_pca(
             &s,
@@ -430,20 +487,24 @@ impl SparsePCA {
             self.config.tol_obj,
             v,
         );
-        if v { eprintln!("[FISTA]        done ({:.2}s)", t.elapsed().as_secs_f64()); }
+        if v {
+            eprintln!("[FISTA]        done ({:.2}s)", t.elapsed().as_secs_f64());
+        }
 
         // Rayleigh quotients for the k signal components (used in validate.rs
         // for the predicted-overlap table via BBP formula, Eq. 9).
         let eigenvalues: Vec<f64> = rq[..k].to_vec();
 
         // KS diagnostic: only available in Full mode when compute_ks = true.
-        let ks_distance = if self.config.compute_ks
-            && self.config.eigensolver == EigensolverMode::Full
-        {
-            Some(crate::verification::calculate_bulk_ks(&s_eigenvalues, rmt.q))
-        } else {
-            None
-        };
+        let ks_distance =
+            if self.config.compute_ks && self.config.eigensolver == EigensolverMode::Full {
+                Some(crate::verification::calculate_bulk_ks(
+                    &s_eigenvalues,
+                    rmt.q,
+                ))
+            } else {
+                None
+            };
 
         // P2.B: expose biwhitening factors as plain Vec<f64> for ergonomic
         // (de)serialisation by callers.
@@ -451,10 +512,20 @@ impl SparsePCA {
         let bw_d: Vec<f64> = (0..d.nrows()).map(|j| d.read(j)).collect();
 
         SparsePCAResult {
-            components, eigenvalues, s_eigenvalues,
-            lambda_plus, q: rmt.q, sigma_sq, ks_distance,
-            sk_iters: bw_iters, sk_converged: bw_ok, sk_residual: bw_res,
-            bw_c, bw_d, s_eigenvalues_unrescaled, top_eigenvectors,
+            components,
+            eigenvalues,
+            s_eigenvalues,
+            lambda_plus,
+            q: rmt.q,
+            sigma_sq,
+            ks_distance,
+            sk_iters: bw_iters,
+            sk_converged: bw_ok,
+            sk_residual: bw_res,
+            bw_c,
+            bw_d,
+            s_eigenvalues_unrescaled,
+            top_eigenvectors,
         }
     }
 }
@@ -565,7 +636,15 @@ pub(crate) fn fista_sparse_pca(
             for j in 0..k {
                 let v = z.read(i, j);
                 let shrunk = v.abs() - lambda * gamma;
-                z.as_mut().write(i, j, if shrunk > 0.0 { shrunk * v.signum() } else { 0.0 });
+                z.as_mut().write(
+                    i,
+                    j,
+                    if shrunk > 0.0 {
+                        shrunk * v.signum()
+                    } else {
+                        0.0
+                    },
+                );
             }
         }
 
@@ -582,7 +661,10 @@ pub(crate) fn fista_sparse_pca(
         if verbose && (iter + 1) % 50 == 0 {
             eprintln!(
                 "[FISTA]        iter {:>4}  Var={:.6}  ΔVar={:.2e}  ΔW={:.2e}",
-                iter + 1, obj_new, dvar, dw
+                iter + 1,
+                obj_new,
+                dvar,
+                dw
             );
         }
 
@@ -607,7 +689,9 @@ pub(crate) fn fista_sparse_pca(
         // and preserve the O(1/k²) convergence guarantee.
         let next_t = (1.0 / 20.0 + (1.0 + 4.0 * t * t).sqrt()) / 2.0;
         let beta = (t - 1.0) / next_t;
-        y = Mat::from_fn(p, k, |i, j| z.read(i, j) + beta * (z.read(i, j) - prev_w.read(i, j)));
+        y = Mat::from_fn(p, k, |i, j| {
+            z.read(i, j) + beta * (z.read(i, j) - prev_w.read(i, j))
+        });
         w = z;
         t = next_t;
     }
@@ -723,7 +807,9 @@ mod tests {
         // λ_max ≈ 3·‖v₀‖²·4 = 3.01; FISTA with λ=0 should recover v₀.
         let p = 4;
         let v0 = [0.5, 0.5, 0.5, 0.5];
-        let mut s = Mat::from_fn(p, p, |i, j| 3.0 * v0[i] * v0[j] + if i == j { 0.01 } else { 0.0 });
+        let mut s = Mat::from_fn(p, p, |i, j| {
+            3.0 * v0[i] * v0[j] + if i == j { 0.01 } else { 0.0 }
+        });
         let _ = &mut s;
 
         let v_init = Mat::from_fn(p, 1, |i, _| if i == 0 { 1.0 } else { 0.0 });

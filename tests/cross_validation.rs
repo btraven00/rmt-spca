@@ -13,8 +13,9 @@ use rmt_spca::rmt::RmtTheory;
 
 fn load<T: serde::de::DeserializeOwned>(name: &str) -> T {
     let path = format!("test_vectors/{name}");
-    let data = fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("Missing test vector file {path}: {e}\nRun: uv run scripts/generate_test_vectors.py"));
+    let data = fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!("Missing test vector file {path}: {e}\nRun: uv run scripts/generate_test_vectors.py")
+    });
     serde_json::from_str(&data).unwrap_or_else(|e| panic!("Bad JSON in {path}: {e}"))
 }
 
@@ -38,7 +39,10 @@ fn mp_pdf_matches_python() {
         assert!(
             (got - c.expected).abs() < tol,
             "PDF case {i}: q={}, x={}, got={got}, expected={}, diff={:.2e}",
-            c.q, c.x, c.expected, (got - c.expected).abs()
+            c.q,
+            c.x,
+            c.expected,
+            (got - c.expected).abs()
         );
     }
 }
@@ -65,11 +69,17 @@ fn mp_cdf_matches_python() {
         // Simpson's rule with 2000 panels vs scipy.integrate.quad.
         // For q=1, λ-=0 and ρ_MP(x) ~ 1/√x is singular — Simpson underestimates
         // the integral by a few percent. Use a looser tolerance there.
-        let tol = if (c.q - 1.0).abs() < 1e-10 { 0.03 } else { 5e-4 };
+        let tol = if (c.q - 1.0).abs() < 1e-10 {
+            0.03
+        } else {
+            5e-4
+        };
         assert!(
             err < tol,
             "CDF case {i}: q={}, x={}, got={got}, expected={}, diff={err:.2e}",
-            c.q, c.x, c.expected
+            c.q,
+            c.x,
+            c.expected
         );
     }
     eprintln!("mp_cdf max error vs Python: {max_err:.2e}");
@@ -106,7 +116,8 @@ fn mp_median_matches_python() {
         assert!(
             (got - expected).abs() < tol,
             "Median case {i}: q={}, got={got}, expected={expected}, diff={:.4e}",
-            c.q, (got - expected).abs()
+            c.q,
+            (got - expected).abs()
         );
     }
 }
@@ -132,7 +143,11 @@ fn bbp_alpha_matches_python() {
         let rmt = RmtTheory { q: c.q };
         let ov = rmt.predicted_overlap(c.lambda);
         // Sanity: overlap must be in (0, 1) for outliers above λ+
-        assert!(ov > 0.0 && ov < 1.0, "overlap out of range for α={}", c.expected_alpha);
+        assert!(
+            ov > 0.0 && ov < 1.0,
+            "overlap out of range for α={}",
+            c.expected_alpha
+        );
     }
     eprintln!("bbp_alpha: {} cases checked via round-trip", cases.len());
 }
@@ -160,7 +175,9 @@ fn bbp_overlap_matches_python() {
         assert!(
             err < 1e-10,
             "Overlap case {i}: q={}, λ={}, got={got}, expected={}, diff={err:.2e}",
-            c.q, c.lambda, c.expected_overlap
+            c.q,
+            c.lambda,
+            c.expected_overlap
         );
     }
     eprintln!("bbp_overlap max error vs Python: {max_err:.2e}");
@@ -245,7 +262,8 @@ fn biwhitening_eigenvalues_near_python() {
     let s: faer::Mat<f64> = xwc.as_ref().transpose() * xwc.as_ref();
     let s = faer::Mat::from_fn(p, p, |i, j| s.read(i, j) / (n - 1) as f64);
 
-    let evd = faer::linalg::solvers::SelfAdjointEigendecomposition::new(s.as_ref(), faer::Side::Lower);
+    let evd =
+        faer::linalg::solvers::SelfAdjointEigendecomposition::new(s.as_ref(), faer::Side::Lower);
     let mut eigs: Vec<f64> = (0..p).map(|i| evd.s().column_vector().read(i)).collect();
     eigs.sort_by(|a, b| b.partial_cmp(a).unwrap());
 
@@ -262,7 +280,8 @@ fn biwhitening_eigenvalues_near_python() {
         assert!(
             rel_err < 0.10,
             "eigenvalue {k}: rust={:.4}, python={:.4}, rel_err={rel_err:.2e}",
-            eigs[k], py_eigs[k]
+            eigs[k],
+            py_eigs[k]
         );
     }
 
@@ -305,7 +324,8 @@ fn spiked_model_eigenvalues_match() {
     // Compute covariance eigenvalues (1/(n-1) convention, matching Python)
     let s: faer::Mat<f64> = x.as_ref().transpose() * x.as_ref();
     let s = faer::Mat::from_fn(p, p, |i, j| s.read(i, j) / (n - 1) as f64);
-    let evd = faer::linalg::solvers::SelfAdjointEigendecomposition::new(s.as_ref(), faer::Side::Lower);
+    let evd =
+        faer::linalg::solvers::SelfAdjointEigendecomposition::new(s.as_ref(), faer::Side::Lower);
     let mut eigs: Vec<f64> = (0..p).map(|i| evd.s().column_vector().read(i)).collect();
     eigs.sort_by(|a, b| b.partial_cmp(a).unwrap());
 
@@ -315,7 +335,8 @@ fn spiked_model_eigenvalues_match() {
         assert!(
             err < 1e-8,
             "top eigenvalue {k}: rust={:.6}, python={:.6}, diff={err:.2e}",
-            eigs[k], data.top_eigenvalues[k]
+            eigs[k],
+            data.top_eigenvalues[k]
         );
     }
 }
@@ -329,7 +350,8 @@ fn spiked_model_bbp_predictions() {
     assert!(
         (rmt.lambda_plus() - data.lambda_plus).abs() < 1e-12,
         "lambda_plus: rust={}, python={}",
-        rmt.lambda_plus(), data.lambda_plus
+        rmt.lambda_plus(),
+        data.lambda_plus
     );
 
     // Predicted overlaps from observed outlier eigenvalues
@@ -343,7 +365,8 @@ fn spiked_model_bbp_predictions() {
         // Instead, verify the formula applied to the same input matches.
         let ov_from_strength = rmt.predicted_overlap(
             // Forward BBP: α + q·α/(α-1) for the k-th signal strength
-            data.signal_strengths[k] + data.q * data.signal_strengths[k] / (data.signal_strengths[k] - 1.0)
+            data.signal_strengths[k]
+                + data.q * data.signal_strengths[k] / (data.signal_strengths[k] - 1.0),
         );
         let err2 = (ov_from_strength - data.predicted_overlaps[k]).abs();
         assert!(
@@ -382,7 +405,8 @@ fn spiked_model_full_pipeline() {
     assert!(
         result.eigenvalues.len() >= data.k,
         "detected {} components, expected at least {}",
-        result.eigenvalues.len(), data.k
+        result.eigenvalues.len(),
+        data.k
     );
 
     // Lambda plus should match
@@ -390,7 +414,8 @@ fn spiked_model_full_pipeline() {
     assert!(
         (rmt.lambda_plus() - data.lambda_plus).abs() / data.lambda_plus < 0.01,
         "lambda_plus mismatch: rust={}, python={}",
-        rmt.lambda_plus(), data.lambda_plus
+        rmt.lambda_plus(),
+        data.lambda_plus
     );
 
     // KS test on bulk eigenvalues should be small
@@ -407,5 +432,8 @@ fn spiked_model_full_pipeline() {
         .count();
     let sparsity = 1.0 - nnz as f64 / (out_p * out_k) as f64;
     eprintln!("sparsity: {sparsity:.2} ({nnz}/{} nonzero)", out_p * out_k);
-    assert!(sparsity > 0.1, "components not sparse enough: {sparsity:.2}");
+    assert!(
+        sparsity > 0.1,
+        "components not sparse enough: {sparsity:.2}"
+    );
 }

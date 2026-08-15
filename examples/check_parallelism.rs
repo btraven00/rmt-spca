@@ -8,10 +8,16 @@ fn main() {
 
     let t = std::time::Instant::now();
     let _s: faer::Mat<f64> = x.as_ref().transpose() * x.as_ref();
-    eprintln!("5000x5000 GEMM (parallel): {:.1}ms", t.elapsed().as_secs_f64() * 1000.0);
+    eprintln!(
+        "5000x5000 GEMM (parallel): {:.1}ms",
+        t.elapsed().as_secs_f64() * 1000.0
+    );
 
     faer::set_global_parallelism(faer::Parallelism::None);
     let t = std::time::Instant::now();
     let _s: faer::Mat<f64> = x.as_ref().transpose() * x.as_ref();
-    eprintln!("5000x5000 GEMM (serial):   {:.1}ms", t.elapsed().as_secs_f64() * 1000.0);
+    eprintln!(
+        "5000x5000 GEMM (serial):   {:.1}ms",
+        t.elapsed().as_secs_f64() * 1000.0
+    );
 }

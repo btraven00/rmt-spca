@@ -106,7 +106,11 @@ impl RmtTheory {
         let mut hi = lp - 1e-9;
         for _ in 0..60 {
             let mid = (lo + hi) / 2.0;
-            if self.mp_cdf(mid) < 0.5 { lo = mid; } else { hi = mid; }
+            if self.mp_cdf(mid) < 0.5 {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
         }
         (lo + hi) / 2.0
     }
@@ -126,7 +130,11 @@ impl RmtTheory {
     pub fn mp_cdf(&self, x: f64) -> f64 {
         // Point mass at 0 for q > 1: fraction (1 − 1/q) of eigenvalues are zero.
         // Matches Python: `if (q > 1): F = 1 - 1/q`.
-        let mass_at_zero = if self.q > 1.0 { 1.0 - 1.0 / self.q } else { 0.0 };
+        let mass_at_zero = if self.q > 1.0 {
+            1.0 - 1.0 / self.q
+        } else {
+            0.0
+        };
         let lm = self.lambda_minus();
         let lp = self.lambda_plus();
         if x <= lm {
@@ -151,11 +159,19 @@ impl RmtTheory {
     pub fn mp_cdf_bulk(&self, x: f64) -> f64 {
         let lm = self.lambda_minus();
         let lp = self.lambda_plus();
-        if x <= lm { return 0.0; }
-        if x >= lp { return 1.0; }
+        if x <= lm {
+            return 0.0;
+        }
+        if x >= lp {
+            return 1.0;
+        }
         let raw = self.mp_cdf_raw(x);
         // For q > 1 the density integrates to 1/q, so scale by q to reach 1.
-        if self.q > 1.0 { (raw * self.q).clamp(0.0, 1.0) } else { raw.clamp(0.0, 1.0) }
+        if self.q > 1.0 {
+            (raw * self.q).clamp(0.0, 1.0)
+        } else {
+            raw.clamp(0.0, 1.0)
+        }
     }
 
     /// Raw Simpson integral of mp_pdf from λ- to x (2000 panels, must be even).
@@ -203,7 +219,7 @@ mod tests {
         // For q > 1 (p > n): point mass (1 − 1/q) at 0.
         // CDF just below λ- should equal (1 − 1/q); at λ+ should equal 1.
         let rmt = RmtTheory { q: 3.0 };
-        let expected_mass = 1.0 - 1.0 / 3.0;  // ≈ 0.667
+        let expected_mass = 1.0 - 1.0 / 3.0; // ≈ 0.667
         let cdf_at_lm = rmt.mp_cdf(rmt.lambda_minus() - 1e-6);
         assert!(
             (cdf_at_lm - expected_mass).abs() < 1e-6,

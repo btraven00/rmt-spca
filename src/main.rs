@@ -24,7 +24,8 @@ fn main() {
         tolerance: 1e-7,
         verbose: true,
         ..FistaConfig::default()
-    }).fit(&x);
+    })
+    .fit(&x);
 
     let (out_p, out_k) = (result.components.nrows(), result.components.ncols());
     let nnz = (0..out_p)
@@ -32,8 +33,13 @@ fn main() {
         .filter(|&(i, j)| result.components.read(i, j).abs() > 1e-6)
         .count();
 
-    println!("Components: {out_k}  non-zero loadings: {nnz}/{}", out_p * out_k);
-    println!("σ² = {:.4}  KS = {:.4}",
+    println!(
+        "Components: {out_k}  non-zero loadings: {nnz}/{}",
+        out_p * out_k
+    );
+    println!(
+        "σ² = {:.4}  KS = {:.4}",
         result.sigma_sq,
-        result.ks_distance.unwrap_or(f64::NAN));
+        result.ks_distance.unwrap_or(f64::NAN)
+    );
 }

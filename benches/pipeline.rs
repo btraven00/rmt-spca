@@ -71,7 +71,11 @@ fn synthetic_scrna(n: usize, p: usize, k_sig: usize, snr: f64, seed: u64) -> Mat
 
         // Sparsity: ~80 % zeros
         let drop = xorshift(&mut rng) < 0.80;
-        if drop { 0.0 } else { (noise + signal).abs() }
+        if drop {
+            0.0
+        } else {
+            (noise + signal).abs()
+        }
     })
 }
 
@@ -129,8 +133,11 @@ fn bench_fista(c: &mut Criterion) {
             |b, x| {
                 b.iter(|| {
                     black_box(
-                        SparsePCA::new(FistaConfig { verbose: false, ..FistaConfig::default() })
-                            .fit(x),
+                        SparsePCA::new(FistaConfig {
+                            verbose: false,
+                            ..FistaConfig::default()
+                        })
+                        .fit(x),
                     )
                 })
             },
@@ -139,10 +146,5 @@ fn bench_fista(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(
-    benches,
-    bench_biwhitening,
-    bench_covariance,
-    bench_fista,
-);
+criterion_group!(benches, bench_biwhitening, bench_covariance, bench_fista,);
 criterion_main!(benches);

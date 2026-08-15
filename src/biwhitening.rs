@@ -101,7 +101,9 @@ impl Biwhitener {
             let d_prev = d.clone();
             d = Col::from_fn(p, |j| {
                 let denom = u_t_c2.read(j);
-                if denom < 1e-300 { return 1.0; }
+                if denom < 1e-300 {
+                    return 1.0;
+                }
                 let term = d_prev.read(j) * x_t_c.read(j) / n as f64;
                 let d_new = ((n as f64 * (1.0 + term.powi(2))) / denom).sqrt();
                 (1.0 - alpha) * d_prev.read(j) + alpha * d_new
@@ -117,7 +119,9 @@ impl Biwhitener {
             // Guard: all-zero cell row → keep c_i = 1.
             c = Col::from_fn(n, |i| {
                 let denom = u_d2.read(i);
-                if denom < 1e-300 { return 1.0; }
+                if denom < 1e-300 {
+                    return 1.0;
+                }
                 let term = prev_c.read(i) * x_d.read(i) / p as f64;
                 let c_new = ((p as f64 * (1.0 + term.powi(2))) / denom).sqrt();
                 (1.0 - alpha) * prev_c.read(i) + alpha * c_new
@@ -155,7 +159,9 @@ impl Biwhitener {
     ///
     /// This is the matrix diag(c) X diag(d) from Algorithm 1, line 10.
     pub fn apply(x: &Mat<f64>, c: &Col<f64>, d: &Col<f64>) -> Mat<f64> {
-        Mat::from_fn(x.nrows(), x.ncols(), |i, j| c.read(i) * x.read(i, j) * d.read(j))
+        Mat::from_fn(x.nrows(), x.ncols(), |i, j| {
+            c.read(i) * x.read(i, j) * d.read(j)
+        })
     }
 }
 
@@ -176,7 +182,9 @@ mod tests {
     fn convergence_and_positivity() {
         let n = 40;
         let p = 20;
-        let x = Mat::from_fn(n, p, |i, j| (i + 1) as f64 * (j + 1) as f64 / (n * p) as f64 + 0.1);
+        let x = Mat::from_fn(n, p, |i, j| {
+            (i + 1) as f64 * (j + 1) as f64 / (n * p) as f64 + 0.1
+        });
         let bw = Biwhitener::default();
         let (c, d, _, _, _) = bw.compute(&x);
 
