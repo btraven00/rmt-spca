@@ -38,9 +38,13 @@ pub struct Biwhitener {
     /// Each update is blended with the previous value:
     ///   c_new = (1 − α)·c_old + α·c_computed
     ///
-    /// α = 1.0 (default) is the standard Sinkhorn step.  α < 1 damps
-    /// oscillations that can arise on log-normalised data or matrices with
-    /// large dynamic range.  Try α = 0.5–0.8 if the algorithm stagnates.
+    /// α = 1.0 is the standard Sinkhorn step.  α < 1 damps oscillations that
+    /// arise on log-normalised data or matrices with large dynamic range.
+    ///
+    /// Default is 0.3, not 1.0: the undamped step oscillates on real count
+    /// data and never reaches `tol`, so `compute()` returns `converged =
+    /// false` and callers discard the factors.  Raise it only after checking
+    /// convergence on your own data.
     pub damp: f64,
 }
 
@@ -49,7 +53,7 @@ impl Default for Biwhitener {
         Self {
             max_iter: 1000,
             tol: 1e-6,
-            damp: 1.0,
+            damp: 0.3,
         }
     }
 }

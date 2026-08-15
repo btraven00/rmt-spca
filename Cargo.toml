@@ -12,7 +12,6 @@ exclude = [
     "test_vectors/",
     "scripts/",
     "docs/",
-    "examples/check_parallelism.rs",
 ]
 
 [dependencies]

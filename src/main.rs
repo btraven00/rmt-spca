@@ -14,7 +14,7 @@ fn main() {
         } else {
             0.0
         };
-        let noise = ((i * 7 + j * 13) as f64 * 0.6931).sin() * 0.3;
+        let noise = ((i * 7 + j * 13) as f64 * 0.7913).sin() * 0.3;
         signal + noise
     });
 

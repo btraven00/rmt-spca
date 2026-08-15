@@ -310,8 +310,8 @@ fn spiked_model_eigenvalues_match() {
     eigs.sort_by(|a, b| b.partial_cmp(a).unwrap());
 
     // Eigenvalues should match Python exactly (same data, same linear algebra)
-    for k in 0..data.k {
-        let err = (eigs[k] - data.top_eigenvalues[k]).abs();
+    for (k, &eig) in eigs.iter().take(data.k).enumerate() {
+        let err = (eig - data.top_eigenvalues[k]).abs();
         assert!(
             err < 1e-8,
             "top eigenvalue {k}: rust={:.6}, python={:.6}, diff={err:.2e}",

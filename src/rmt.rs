@@ -275,6 +275,6 @@ mod tests {
         let lp = rmt.lambda_plus();
         // A strong outlier well above lambda_plus
         let ov = rmt.predicted_overlap(lp * 2.0);
-        assert!(ov >= 0.0 && ov <= 1.0, "overlap={ov}");
+        assert!((0.0..=1.0).contains(&ov), "overlap={ov}");
     }
 }

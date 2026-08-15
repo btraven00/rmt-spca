@@ -16,7 +16,7 @@ fn synthetic_scrna(n: usize, p: usize, k_sig: usize, snr: f64, seed: u64) -> Mat
     let q = p as f64 / n as f64;
     let lp = (1.0 + q.sqrt()).powi(2);
     let signal_scale = (snr * lp).sqrt();
-    let mut dirs: Vec<Vec<f64>> = (0..k_sig).map(|_| {
+    let dirs: Vec<Vec<f64>> = (0..k_sig).map(|_| {
         let mut v: Vec<f64> = (0..p).map(|_| {
             let u1 = xorshift(&mut rng).max(1e-300);
             let u2 = xorshift(&mut rng);

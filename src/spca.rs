@@ -1,7 +1,7 @@
 use std::time::Instant;
 
 use faer::linalg::solvers::SelfAdjointEigendecomposition;
-use faer::{Mat, Side};
+use faer::{Col, Mat, Side};
 
 use crate::biwhitening::Biwhitener;
 use crate::rmt::RmtTheory;
@@ -10,7 +10,7 @@ use crate::rmt::RmtTheory;
 /// and whether the full eigenspectrum is computed.
 ///
 /// The default is `Full`, which is the only safe choice for production use.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum EigensolverMode {
     /// Full O(p³) symmetric EVD (default).
     ///
@@ -18,6 +18,7 @@ pub enum EigensolverMode {
     /// - σ² = median(bulk eigenvalues) / median(MP distribution) — exact and
     ///   robust: filtered to bulk range, unaffected by signal outliers.
     /// - KS diagnostic available (requires `compute_ks = true`).
+    #[default]
     Full,
 
     /// ⚠️  APPROXIMATE — validate against `Full` before use in production.
@@ -44,10 +45,6 @@ pub enum EigensolverMode {
     Fast,
 }
 
-impl Default for EigensolverMode {
-    fn default() -> Self { EigensolverMode::Full }
-}
-
 /// Configuration for the full Sparse PCA pipeline (Algorithm 2).
 ///
 /// The pipeline implements the method from Chardès et al.:
@@ -72,8 +69,13 @@ pub struct FistaConfig {
     pub verbose: bool,
     /// Maximum Sinkhorn-Knopp iterations for biwhitening (default 1000).
     pub bw_max_iter: usize,
-    /// Sinkhorn under-relaxation factor α ∈ (0, 1].  Default 1.0 (no damping).
-    /// Set to 0.5–0.8 if biwhitening oscillates on your data.
+    /// Sinkhorn under-relaxation factor α ∈ (0, 1].  Default 0.3.
+    ///
+    /// The undamped step (α = 1.0) oscillates on real count data: it never
+    /// reaches `Biwhitener::tol` = 1e-6, so `fit()` silently discards the
+    /// factors and drops to the per-gene standardisation fallback.  α = 0.3
+    /// converges.  Raise it towards 1.0 only if you have checked that
+    /// `sk_converged` is still true on your data.
     pub bw_damp: f64,
     /// Eigensolver mode controlling σ² estimation and eigenspectrum computation.
     /// Default: `EigensolverMode::Full` (exact, safe for production).
@@ -86,6 +88,26 @@ pub struct FistaConfig {
     /// Set to `false` to skip the KS test when the diagnostic is not needed;
     /// the eigenspectrum is still computed for σ² in `Full` mode regardless.
     pub compute_ks: bool,
+    /// **P2.A** — precomputed biwhitening factors (c, d). When set, the
+    /// Sinkhorn-Knopp iteration is skipped and these factors are used directly.
+    /// Lengths must match the matrix shape *after* Stage 0 zero-row/col filtering;
+    /// the driver is responsible for subsetting `c` to the cells that survive
+    /// filtering, and likewise `d` for genes. When `None` (default), biwhitening
+    /// runs as usual.
+    pub precomputed_factors: Option<(Col<f64>, Col<f64>)>,
+    /// **P2.B** — how many top eigenvectors of the σ̂²-rescaled covariance to
+    /// return in `SparsePCAResult::top_eigenvectors` (default 20). Has no
+    /// effect in `EigensolverMode::Fast` (no full EVD).
+    pub top_eigvec_count: usize,
+    /// Ceiling on how many signal components Stage 5's subspace iteration will
+    /// look for. k is then `count(rayleigh quotient > λ+)`, so this caps k.
+    ///
+    /// Was a hard-coded 20, which **bound on every real dataset tested**, and
+    /// silently: be1 (1715×2000) has 72 eigenvalues above λ+ but reported k=20,
+    /// and a capped result is indistinguishable from a genuine k=20. Raise it
+    /// when the component count is what you care about — cost is
+    /// O(p² · k_max · iters) here, then O(p² · k · iters) in FISTA.
+    pub k_max: usize,
 }
 
 impl Default for FistaConfig {
@@ -98,9 +120,12 @@ impl Default for FistaConfig {
             lambda_frac: None,
             verbose: false,
             bw_max_iter: 1000,
-            bw_damp: 1.0,
+            bw_damp: 0.3,
             eigensolver: EigensolverMode::Full,
             compute_ks: true,
+            precomputed_factors: None,
+            top_eigvec_count: 20,
+            k_max: 20,
         }
     }
 }
@@ -185,10 +210,24 @@ impl SparsePCA {
         // Run on the original non-negative data so that Sinkhorn-Knopp sees
         // only non-negative values, which is the domain the algorithm was
         // derived for.  Centring happens in Stage 2 after scaling.
+        //
+        // P2.A path: if precomputed factors were provided in the config, use
+        // them directly and skip Sinkhorn-Knopp.  Caller is responsible for
+        // shape-matching to the (post-filter) (n, p) — we assert it here.
         if v { eprint!("[biwhitening]  {n}×{p} matrix ... "); }
         let t = Instant::now();
         let bw = Biwhitener { max_iter: self.config.bw_max_iter, damp: self.config.bw_damp, ..Biwhitener::default() };
-        let (c, d, bw_iters, bw_ok, bw_res) = bw.compute(data);
+        let (c, d, bw_iters, bw_ok, bw_res) = match &self.config.precomputed_factors {
+            Some((c_in, d_in)) => {
+                assert_eq!(c_in.nrows(), n,
+                    "precomputed_factors c length {} != n {} (after zero-row/col filter)", c_in.nrows(), n);
+                assert_eq!(d_in.nrows(), p,
+                    "precomputed_factors d length {} != p {} (after zero-row/col filter)", d_in.nrows(), p);
+                if v { eprint!("[precomputed factors, skip Sinkhorn-Knopp] "); }
+                (c_in.clone(), d_in.clone(), 0_usize, true, 0.0_f64)
+            }
+            None => bw.compute(data),
+        };
 
         // Fallback: if biwhitening stagnated badly, use per-gene standardisation.
         let xw = if !bw_ok && bw_res > 1e-2 {
@@ -252,12 +291,28 @@ impl SparsePCA {
         //   See `EigensolverMode::Fast` documentation for bias analysis.
         let rmt_pre = RmtTheory { q: p as f64 / n as f64 };
 
+        // P2.B: capture the top-K eigenvectors when running Full EVD. faer's
+        // SelfAdjointEigendecomposition returns eigenvalues sorted ascending
+        // in `evd.s()` and eigenvectors as columns of `evd.u()`. So the top-K
+        // (largest) are the LAST K columns of u(), in reverse order.
+        let top_eigvec_count = self.config.top_eigvec_count.min(p);
+        let mut top_eigenvectors: Vec<Vec<f64>> = Vec::new();
+
         let (sigma_sq, s_eigenvalues): (f64, Vec<f64>) = match self.config.eigensolver {
             EigensolverMode::Full => {
                 if v { eprint!("[eigenspectrum] full EVD ({p}×{p}) ... "); }
                 let t = Instant::now();
                 let evd = SelfAdjointEigendecomposition::new(s.as_ref(), Side::Lower);
                 let raw_eigs: Vec<f64> = (0..p).map(|i| evd.s().column_vector().read(i)).collect();
+                if top_eigvec_count > 0 {
+                    let u = evd.u();
+                    // last K columns, reversed to be sorted descending
+                    for k in 0..top_eigvec_count {
+                        let col_idx = p - 1 - k;
+                        let col: Vec<f64> = (0..p).map(|i| u.read(i, col_idx)).collect();
+                        top_eigenvectors.push(col);
+                    }
+                }
                 if v { eprint!("done ({:.2}s)  ", t.elapsed().as_secs_f64()); }
 
                 let lambda_med_mp = rmt_pre.mp_median();
@@ -301,6 +356,9 @@ impl SparsePCA {
         } else if v {
             eprintln!("[normalisation] σ² = {sigma_sq:.4}  (≈1, scale already correct)");
         }
+        // P2.B: preserve the pre-σ̂²-rescale eigenvalues alongside the
+        // rescaled ones. The rescaled version is what existing consumers see.
+        let s_eigenvalues_unrescaled: Vec<f64> = s_eigenvalues.clone();
         let s = Mat::from_fn(p, p, |i, j| s.read(i, j) / sigma_sq);
         let s_eigenvalues: Vec<f64> = s_eigenvalues.iter().map(|&e| e / sigma_sq).collect();
 
@@ -311,11 +369,11 @@ impl SparsePCA {
         // Subspace iteration on S converges to the top-k_max eigenvectors.
         // Rayleigh quotients rq_j = v_j^T S v_j approximate the eigenvalues
         // without a full O(p³) decomposition.
-        if v { eprint!("[RMT/subspace] subspace iteration (k_max=20) ... "); }
+        let k_max = self.config.k_max.min(p).min(n);
+        if v { eprint!("[RMT/subspace] subspace iteration (k_max={k_max}) ... "); }
         let t = Instant::now();
         let rmt = rmt_pre;  // reuse — same q = p/n
         let lambda_plus = rmt.lambda_plus();
-        let k_max = 20_usize.min(p).min(n);
         let v_cand = subspace_iteration(&s, k_max, 100);
         // Rayleigh quotients  rq_j = v_j^T S v_j
         let sv_cand = mat_mul(&s, &v_cand);
@@ -328,9 +386,21 @@ impl SparsePCA {
         let v_init = Mat::from_fn(p, k, |i, j| v_cand.read(i, j));
         if v {
             eprintln!(
-                "λ_max = {lmax:.4}  λ+ = {lambda_plus:.4}  components = {k}  ({:.2}s)",
+                "λ_max = {lmax:.4}  λ+ = {lambda_plus:.4}  components = {k}{}  ({:.2}s)",
+                if k == k_max { " [CAPPED by k_max]" } else { "" },
                 t.elapsed().as_secs_f64()
             );
+            // k saturating k_max means the count is a ceiling, not a result --
+            // the subspace iteration never looked past k_max, so the true number
+            // of eigenvalues above λ+ may be far higher. Say so: this is the
+            // method's headline output and it must not be silently truncated.
+            if k == k_max {
+                eprintln!(
+                    "[RMT/subspace] WARNING: k saturated k_max={k_max}; the true signal \
+                     count is >= {k_max} and is NOT determined by this run. Raise \
+                     FistaConfig::k_max."
+                );
+            }
         }
 
         // --- Stage 6: FISTA Sparse PCA (Algorithm 2) ---
@@ -375,10 +445,16 @@ impl SparsePCA {
             None
         };
 
+        // P2.B: expose biwhitening factors as plain Vec<f64> for ergonomic
+        // (de)serialisation by callers.
+        let bw_c: Vec<f64> = (0..c.nrows()).map(|i| c.read(i)).collect();
+        let bw_d: Vec<f64> = (0..d.nrows()).map(|j| d.read(j)).collect();
+
         SparsePCAResult {
             components, eigenvalues, s_eigenvalues,
             lambda_plus, q: rmt.q, sigma_sq, ks_distance,
             sk_iters: bw_iters, sk_converged: bw_ok, sk_residual: bw_res,
+            bw_c, bw_d, s_eigenvalues_unrescaled, top_eigenvectors,
         }
     }
 }
@@ -410,11 +486,32 @@ pub struct SparsePCAResult {
     /// `EigensolverMode::Fast` was used.
     pub ks_distance: Option<f64>,
     /// Number of Sinkhorn-Knopp iterations executed during biwhitening.
+    /// Zero when precomputed factors were supplied (P2.A).
     pub sk_iters: usize,
     /// Whether Sinkhorn-Knopp reached its convergence tolerance.
+    /// `true` when precomputed factors were supplied.
     pub sk_converged: bool,
     /// Final 95th-percentile relative change in c at the last SK iteration.
+    /// Zero when precomputed factors were supplied.
     pub sk_residual: f64,
+    /// **P2.B** — biwhitening cell-scaling factors (length = n after Stage 0 filter).
+    /// These are the factors actually used (either from Sinkhorn-Knopp or from
+    /// `FistaConfig::precomputed_factors`). Persist them to reuse across runs
+    /// (P2.A) or to do downstream analyses (e.g. compute per-cell biwhitened
+    /// residuals).
+    pub bw_c: Vec<f64>,
+    /// **P2.B** — biwhitening gene-scaling factors (length = p after Stage 0 filter).
+    pub bw_d: Vec<f64>,
+    /// **P2.B** — eigenvalues of the biwhitened sample covariance *before* the
+    /// σ̂² rescaling (i.e. `s_eigenvalues × sigma_sq`). Empty in `Fast` mode.
+    /// Useful when the consumer wants to apply a custom σ² (e.g. estimated
+    /// from a noise-only run) or to verify the σ̂² estimator.
+    pub s_eigenvalues_unrescaled: Vec<f64>,
+    /// **P2.B** — top eigenvectors of the σ̂²-rescaled covariance, sorted by
+    /// eigenvalue descending. `top_eigenvectors[k]` is a column of length p
+    /// (after Stage 0 filter). Length = `config.top_eigvec_count` (default 20),
+    /// capped to p. Empty in `Fast` mode.
+    pub top_eigenvectors: Vec<Vec<f64>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -437,6 +534,7 @@ pub struct SparsePCAResult {
 /// Stops when either the iterate change ‖W_{t+1}−W_t‖_F < `tol` **or** the
 /// relative objective change falls below `tol_obj` (OR criterion prevents
 /// getting stuck when rotational ambiguity keeps ‖ΔW‖ large).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn fista_sparse_pca(
     s: &Mat<f64>,
     v_init: &Mat<f64>,
@@ -624,7 +722,7 @@ mod tests {
         // S = 3·v₀v₀^T + 0.01·I,  v₀ = [1,1,1,1]/2
         // λ_max ≈ 3·‖v₀‖²·4 = 3.01; FISTA with λ=0 should recover v₀.
         let p = 4;
-        let v0 = vec![0.5, 0.5, 0.5, 0.5];
+        let v0 = [0.5, 0.5, 0.5, 0.5];
         let mut s = Mat::from_fn(p, p, |i, j| 3.0 * v0[i] * v0[j] + if i == j { 0.01 } else { 0.0 });
         let _ = &mut s;
 
