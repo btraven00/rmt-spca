@@ -56,7 +56,7 @@ Key `FistaConfig` fields:
 | `eigensolver` | `Full` | `EigensolverMode::Full` (exact) or `::Fast` (approximate, 4× faster) |
 | `compute_ks` | `true` | Compute KS goodness-of-fit; only available with `Full` eigensolver |
 | `bw_max_iter` | `1000` | Max Sinkhorn-Knopp iterations |
-| `bw_damp` | `1.0` | Sinkhorn under-relaxation ∈ (0,1]; try 0.5–0.8 if biwhitening oscillates |
+| `bw_damp` | `1.0` | Sinkhorn under-relaxation ∈ (0,1]; not needed for convergence, only slows it |
 
 ## Output
 

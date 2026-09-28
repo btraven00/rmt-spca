@@ -69,13 +69,9 @@ pub struct FistaConfig {
     pub verbose: bool,
     /// Maximum Sinkhorn-Knopp iterations for biwhitening (default 1000).
     pub bw_max_iter: usize,
-    /// Sinkhorn under-relaxation factor α ∈ (0, 1].  Default 0.3.
-    ///
-    /// The undamped step (α = 1.0) oscillates on real count data: it never
-    /// reaches `Biwhitener::tol` = 1e-6, so `fit()` silently discards the
-    /// factors and drops to the per-gene standardisation fallback.  α = 0.3
-    /// converges.  Raise it towards 1.0 only if you have checked that
-    /// `sk_converged` is still true on your data.
+    /// Sinkhorn under-relaxation factor α ∈ (0, 1].  Default 1.0 (undamped,
+    /// as in the reference).  α < 1 is never needed for convergence and only
+    /// slows it; see `Biwhitener::damp`.
     pub bw_damp: f64,
     /// Eigensolver mode controlling σ² estimation and eigenspectrum computation.
     /// Default: `EigensolverMode::Full` (exact, safe for production).
@@ -120,7 +116,7 @@ impl Default for FistaConfig {
             lambda_frac: None,
             verbose: false,
             bw_max_iter: 1000,
-            bw_damp: 0.3,
+            bw_damp: 1.0,
             eigensolver: EigensolverMode::Full,
             compute_ks: true,
             precomputed_factors: None,
@@ -157,8 +153,9 @@ impl SparsePCA {
     /// X_w = diag(c) X diag(d) has unit per-cell and per-gene second moments.
     /// The algorithm is run on the *original non-negative* matrix; centring
     /// afterward prevents oscillation from negative values in the update.
-    /// If biwhitening stagnates with residual > 1e-2, falls back to per-gene
-    /// standardisation (divide each column by its standard deviation).
+    /// If biwhitening hits `bw_max_iter` with X_w's variances still moving by
+    /// more than 1e-2 per iteration, falls back to per-gene standardisation
+    /// (divide each column by its standard deviation).
     ///
     /// **Stage 2 — Mean centring**
     /// Subtract column means from X_w.  Required so that
@@ -247,11 +244,12 @@ impl SparsePCA {
             None => bw.compute(data),
         };
 
-        // Fallback: if biwhitening stagnated badly, use per-gene standardisation.
+        // Fallback: if biwhitening did not converge and X_w's variances were
+        // still moving by > 1e-2 per iteration, use per-gene standardisation.
         let xw = if !bw_ok && bw_res > 1e-2 {
             if v {
                 eprintln!(
-                    "stagnated after {bw_iters} iters (residual={bw_res:.2e}) — \
+                    "not converged after {bw_iters} iters (residual={bw_res:.2e}) — \
                      falling back to per-gene standardisation ({:.2}s)",
                     t.elapsed().as_secs_f64()
                 );
@@ -272,12 +270,6 @@ impl SparsePCA {
                 if bw_ok {
                     eprintln!(
                         "converged in {bw_iters} iters ({:.2}s)",
-                        t.elapsed().as_secs_f64()
-                    );
-                } else if bw_iters < bw.max_iter {
-                    eprintln!(
-                        "stagnated at iter {bw_iters}/{} residual={bw_res:.2e} ({:.2}s)",
-                        bw.max_iter,
                         t.elapsed().as_secs_f64()
                     );
                 } else {

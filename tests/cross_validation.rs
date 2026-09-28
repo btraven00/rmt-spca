@@ -206,10 +206,8 @@ fn biwhitening_produces_unit_variance() {
     // Build the faer matrix from the test vector
     let x = faer::Mat::from_fn(n, p, |i, j| data.x[i][j]);
 
-    // Use default tolerance (1e-6) and allow stagnation — the Rust
-    // convergence criterion (95th-pct relative change in c) is stricter
-    // than Python's (max variance residual change). What matters is that
-    // the output has approximately unit variance.
+    // What matters here is that the output has approximately unit variance;
+    // convergence itself is covered by biwhitening_converges_with_defaults.
     let bw = rmt_spca::biwhitening::Biwhitener {
         max_iter: 5000,
         tol: 1e-6,
@@ -436,4 +434,28 @@ fn spiked_model_full_pipeline() {
         sparsity > 0.1,
         "components not sparse enough: {sparsity:.2}"
     );
+}
+
+/// Regression: the Sinkhorn stopping rule must not depend on the (c·t, d/t)
+/// gauge. Mean-corrected unit-variance targets have no exact joint solution,
+/// so the iteration settles X_w = diag(c) X diag(d) while c and d keep sliding
+/// in opposite directions. Testing the relative change in c read that slide as
+/// non-convergence: on this vector the old rule stagnated after 178 iters, and
+/// on be1 raw counts the residual sat above 1e-2, so `fit()` discarded the
+/// factors for per-gene standardisation. The reference (spcarmt
+/// `biwhitening`) stops on the variance residuals of X_w instead.
+#[test]
+fn biwhitening_converges_with_defaults() {
+    let data: BiwhiteningData = load("biwhitening.json");
+    let x = faer::Mat::from_fn(data.n, data.p, |i, j| data.x[i][j]);
+
+    let (_, _, iters, converged, res) = rmt_spca::biwhitening::Biwhitener::default().compute(&x);
+    assert!(
+        converged,
+        "did not converge: {iters} iters, residual {res:.2e}"
+    );
+    assert!(iters < 200, "took {iters} iters; reference needs ~80");
+
+    let result = rmt_spca::spca::SparsePCA::new(rmt_spca::spca::FistaConfig::default()).fit(&x);
+    assert!(result.sk_converged, "fit() reports sk_converged=false");
 }
