@@ -27,24 +27,29 @@ use faer::{Col, Mat};
 /// where U_ij = x²_ij.  The mean-correction terms account for non-zero
 /// column means; they vanish exactly when the data is centred, in which
 /// case the update reduces to pure variance normalisation.
+///
+/// **Convergence is judged on X_w, never on c or d.**  With the mean
+/// correction the row and column targets are not jointly satisfiable (both
+/// sides share one total second moment but subtract different means), so the
+/// iteration settles X_w at a compromise while c and d keep sliding along the
+/// gauge (c·t, d/t), which leaves X_w unchanged.  The stopping rule is the
+/// reference's (spcarmt `biwhitening`): the max change, between iterations,
+/// of |Var(X_w) − 1| over genes and cells.
 pub struct Biwhitener {
     /// Maximum number of Sinkhorn-Knopp iterations (default 1000).
     pub max_iter: usize,
-    /// Convergence tolerance on the 95th-percentile relative change in c
-    /// between consecutive iterations (default 1e-6).
+    /// Convergence tolerance on the max per-iteration change of
+    /// |Var(X_w) − 1| over genes and cells (default 1e-5, the reference's).
     pub tol: f64,
     /// Under-relaxation (damping) factor α ∈ (0, 1].
     ///
     /// Each update is blended with the previous value:
     ///   c_new = (1 − α)·c_old + α·c_computed
     ///
-    /// α = 1.0 is the standard Sinkhorn step.  α < 1 damps oscillations that
-    /// arise on log-normalised data or matrices with large dynamic range.
-    ///
-    /// Default is 0.3, not 1.0: the undamped step oscillates on real count
-    /// data and never reaches `tol`, so `compute()` returns `converged =
-    /// false` and callers discard the factors.  Raise it only after checking
-    /// convergence on your own data.
+    /// α = 1.0 is the standard Sinkhorn step (default, as in the reference).
+    /// Damping is not needed for convergence: the apparent oscillation it was
+    /// once added for was gauge drift, see the struct docs.  α < 1 only slows
+    /// the iteration down (~3x at 0.3 on count data).
     pub damp: f64,
 }
 
@@ -52,8 +57,8 @@ impl Default for Biwhitener {
     fn default() -> Self {
         Self {
             max_iter: 1000,
-            tol: 1e-6,
-            damp: 0.3,
+            tol: 1e-5,
+            damp: 1.0,
         }
     }
 }
@@ -65,12 +70,8 @@ impl Biwhitener {
     /// - `c`         — cell scaling vector (length n)
     /// - `d`         — gene scaling vector (length p)
     /// - `iters`     — number of iterations executed
-    /// - `converged` — true iff the 95th-pct relative change fell below `tol`
-    /// - `residual`  — final 95th-pct relative change in c
-    ///
-    /// The 95th-percentile (rather than maximum) residual is used so that a
-    /// small number of outlier cells with extreme expression profiles do not
-    /// prevent convergence for the other 95% of cells.
+    /// - `converged` — true iff the change of |Var(X_w) − 1| fell below `tol`
+    /// - `residual`  — that change at the last iteration
     pub fn compute(&self, x: &Mat<f64>) -> (Col<f64>, Col<f64>, usize, bool, f64) {
         let (n, p) = (x.nrows(), x.ncols());
 
@@ -82,19 +83,19 @@ impl Biwhitener {
 
         let mut iters = 0_usize;
         let mut last_res = f64::INFINITY;
-        let mut best_res = f64::INFINITY;
-        let mut iters_since_improvement = 0_usize;
+        // |Var(X_w) − 1| per gene and per cell at the previous iteration
+        let mut gene_dev = vec![0.0_f64; p];
+        let mut cell_dev = vec![0.0_f64; n];
+        // (X^T c)_j = Σᵢ cᵢ xᵢⱼ and (U^T c²)_j = Σᵢ c²ᵢ x²ᵢⱼ  — BLAS gemv
+        let mut x_t_c: Col<f64> = x.as_ref().transpose() * c.as_ref();
+        let mut u_t_c2: Col<f64> = u.as_ref().transpose() * c.as_ref(); // c = 1, so c² = c
         for _ in 0..self.max_iter {
             iters += 1;
             let prev_c = c.clone();
 
             // --- Update d (gene-wise scaling, Algorithm 1 line 5) ---
-            // c²_i = c_i²
-            let c2 = Col::from_fn(n, |i| c.read(i).powi(2));
-            // (X^T c)_j = Σᵢ cᵢ xᵢⱼ  — BLAS gemv
-            let x_t_c: Col<f64> = x.as_ref().transpose() * c.as_ref();
-            // (U^T c²)_j = Σᵢ c²ᵢ x²ᵢⱼ  — BLAS gemv
-            let u_t_c2: Col<f64> = u.as_ref().transpose() * c2.as_ref();
+            // uses (X^T c) and (U^T c²) for the current c, carried over from
+            // the previous iteration's convergence check
             // d_j = √[ n · (1 + (d_j · (X^T c)_j / n)²) / (U^T c²)_j ]
             // Guard: all-zero gene column → keep d_j = 1.
             let alpha = self.damp;
@@ -127,28 +128,31 @@ impl Biwhitener {
                 (1.0 - alpha) * prev_c.read(i) + alpha * c_new
             });
 
-            // Convergence check: 95th-percentile relative change in c.
-            let mut diffs: Vec<f64> = (0..n)
-                .map(|i| (c.read(i) - prev_c.read(i)).abs() / (c.read(i) + 1e-10))
-                .collect();
-            diffs.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
-            last_res = diffs[(n * 95 / 100).min(n - 1)];
+            // Convergence check on X_w (gauge-invariant).  Cell variances reuse
+            // this iteration's gemvs: Var_i = c_i² (U d²)_i / p − (c_i (X d)_i / p)².
+            // Gene variances need the new c; those two gemvs are also what the
+            // next d update needs, so they are not extra work.
+            let c2 = Col::from_fn(n, |i| c.read(i).powi(2));
+            x_t_c = x.as_ref().transpose() * c.as_ref();
+            u_t_c2 = u.as_ref().transpose() * c2.as_ref();
+            let mut change = 0.0_f64;
+            for (j, prev) in gene_dev.iter_mut().enumerate() {
+                let dj = d.read(j);
+                let mean = dj * x_t_c.read(j) / n as f64;
+                let dev = (dj * dj * u_t_c2.read(j) / n as f64 - mean * mean - 1.0).abs();
+                change = change.max((dev - *prev).abs());
+                *prev = dev;
+            }
+            for (i, prev) in cell_dev.iter_mut().enumerate() {
+                let ci = c.read(i);
+                let mean = ci * x_d.read(i) / p as f64;
+                let dev = (ci * ci * u_d2.read(i) / p as f64 - mean * mean - 1.0).abs();
+                change = change.max((dev - *prev).abs());
+                *prev = dev;
+            }
+            last_res = change;
             if last_res < self.tol {
                 return (c, d, iters, true, last_res);
-            }
-
-            // Stagnation detection: stop if the 95th-pct residual has not
-            // improved by ≥ 1% over the last 100 iterations.  This tolerates
-            // linear convergence rates as slow as 0.9999/iter (slow but
-            // genuine progress) while catching true oscillation/divergence.
-            if last_res < best_res * 0.99 {
-                best_res = last_res;
-                iters_since_improvement = 0;
-            } else {
-                iters_since_improvement += 1;
-                if iters_since_improvement >= 100 {
-                    return (c, d, iters, false, last_res);
-                }
             }
         }
 
