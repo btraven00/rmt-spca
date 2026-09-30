@@ -108,6 +108,11 @@ pub struct FistaConfig {
     /// when the component count is what you care about — cost is
     /// O(p² · k_max · iters) here, then O(p² · k · iters) in FISTA.
     pub k_max: usize,
+    /// **Ablation only.** Fit exactly this many components instead of
+    /// `count(rayleigh quotient > λ+)`. The signal count is still computed and
+    /// returned as `SparsePCAResult::k_signal`. Must be <= `k_max`; `fit()`
+    /// panics otherwise rather than silently clamping. Default `None`.
+    pub k_force: Option<usize>,
 }
 
 impl Default for FistaConfig {
@@ -126,6 +131,7 @@ impl Default for FistaConfig {
             precomputed_factors: None,
             top_eigvec_count: 20,
             k_max: 20,
+            k_force: None,
         }
     }
 }
@@ -433,19 +439,32 @@ impl SparsePCA {
             .collect();
         let lmax = rq.iter().cloned().fold(0.0_f64, f64::max);
         // k = number of eigenvalues above the BBP threshold; at least 1.
-        let k = rq.iter().filter(|&&r| r > lambda_plus).count().max(1);
+        let k_signal = rq.iter().filter(|&&r| r > lambda_plus).count().max(1);
+        let k = match self.config.k_force {
+            None => k_signal,
+            Some(n) => {
+                assert!(
+                    (1..=k_max).contains(&n),
+                    "k_force={n} outside [1, k_max={k_max}]: raise k_max, it is not clamped"
+                );
+                n
+            }
+        };
         let v_init = Mat::from_fn(p, k, |i, j| v_cand.read(i, j));
         if v {
             eprintln!(
                 "λ_max = {lmax:.4}  λ+ = {lambda_plus:.4}  components = {k}{}  ({:.2}s)",
-                if k == k_max { " [CAPPED by k_max]" } else { "" },
+                if k_signal == k_max { " [CAPPED by k_max]" } else { "" },
                 t.elapsed().as_secs_f64()
             );
             // k saturating k_max means the count is a ceiling, not a result --
             // the subspace iteration never looked past k_max, so the true number
             // of eigenvalues above λ+ may be far higher. Say so: this is the
             // method's headline output and it must not be silently truncated.
-            if k == k_max {
+            if self.config.k_force.is_some() {
+                eprintln!("[RMT/subspace] k_force: fitting {k} components (signal count {k_signal})");
+            }
+            if k_signal == k_max {
                 eprintln!(
                     "[RMT/subspace] WARNING: k saturated k_max={k_max}; the true signal \
                      count is >= {k_max} and is NOT determined by this run. Raise \
@@ -513,6 +532,7 @@ impl SparsePCA {
 
         SparsePCAResult {
             components,
+            k_signal,
             eigenvalues,
             s_eigenvalues,
             lambda_plus,
@@ -535,6 +555,9 @@ pub struct SparsePCAResult {
     /// Sparse loading matrix W (p × k).  Each column is one component;
     /// most entries are zero due to the L1 penalty.
     pub components: Mat<f64>,
+    /// count(rayleigh quotient > λ+), capped by `k_max`: the method's rank.
+    /// Equals `components.ncols()` unless `FistaConfig::k_force` is set.
+    pub k_signal: usize,
     /// Rayleigh quotients v_j^T S v_j for the k signal components (descending).
     /// Used to compute predicted overlaps via the BBP formula (Eq. 9).
     pub eigenvalues: Vec<f64>,
