@@ -5,6 +5,7 @@ use faer::{Col, Mat, Side};
 
 use crate::biwhitening::Biwhitener;
 use crate::rmt::RmtTheory;
+use crate::sparse::CsrMatrix;
 
 /// Controls how the pipeline estimates σ² (the bulk covariance scale factor)
 /// and whether the full eigenspectrum is computed.
@@ -43,6 +44,23 @@ pub enum EigensolverMode {
     /// Typical speedup on large matrices: 5–15× over `Full`.
     /// Always compare `sigma_sq` from both modes on your data before switching.
     Fast,
+
+    /// σ² and the KS diagnostic from the exact spectrum of a **cell subsample**,
+    /// via its m×m Gram matrix: O(m²p + m³) instead of O(p³).
+    ///
+    /// Takes `n_cells` = m evenly spaced cells (deterministic: stratified on
+    /// files sorted in blocks, e.g. by sample; avoid if rows repeat with a period
+    /// that aliases the stride), centred with the
+    /// full-data means. The non-zero eigenvalues of Y_subᵀY_sub/(m−1) equal those
+    /// of the Gram Y_sub Y_subᵀ/(m−1); their bulk is MP with q' = p/m, and the
+    /// noise scale σ² is the same per-entry quantity as on the full data. So σ²
+    /// (bulk median / MP(q') median) and KS (against MP(q')) are exact for the
+    /// subsample and consistent estimators for the whole matrix.
+    ///
+    /// λ+ and the signal count k still use the full q = p/n. `s_eigenvalues`
+    /// holds the subsample spectrum; `top_eigenvectors` is empty.
+    /// With `n_cells ≥ n` this reproduces `Full`'s σ² and KS to round-off.
+    Subsample { n_cells: usize },
 }
 
 /// Configuration for the full Sparse PCA pipeline (Algorithm 2).
@@ -104,6 +122,14 @@ pub struct FistaConfig {
     /// when the component count is what you care about — cost is
     /// O(p² · k_max · iters) here, then O(p² · k · iters) in FISTA.
     pub k_max: usize,
+    /// One S-product per FISTA iteration instead of two (default false).
+    ///
+    /// The objective needs S·W_t and the next gradient needs S·Y_{t+1}, with
+    /// Y_{t+1} = W_t + β(W_t − W_{t−1}). By linearity S·Y_{t+1} = S·W_t +
+    /// β(S·W_t − S·W_{t−1}), both already computed, so the O(p²k) gradient
+    /// product is dropped. Equal in exact arithmetic; in floating point the
+    /// iterates differ at round-off level.
+    pub fista_reuse_products: bool,
 }
 
 impl Default for FistaConfig {
@@ -122,8 +148,23 @@ impl Default for FistaConfig {
             precomputed_factors: None,
             top_eigvec_count: 20,
             k_max: 20,
+            fista_reuse_products: false,
         }
     }
+}
+
+/// Output of Stages 0–3: the biwhitened covariance and the biwhitening state.
+struct Front {
+    s: Mat<f64>,
+    n: usize,
+    p: usize,
+    c: Col<f64>,
+    d: Col<f64>,
+    bw_iters: usize,
+    bw_ok: bool,
+    bw_res: f64,
+    /// `EigensolverMode::Subsample`: (subsample spectrum ascending, q' = p/m).
+    sub_spectrum: Option<(Vec<f64>, f64)>,
 }
 
 /// The Sparse PCA pipeline runner.
@@ -302,6 +343,183 @@ impl SparsePCA {
             eprint!("done ({:.2}s)  ", t.elapsed().as_secs_f64());
         }
 
+        let sub_spectrum = self
+            .subsample_rows(n)
+            .map(|rows| gram_spectrum(&Mat::from_fn(rows.len(), p, |t, j| xwc.read(rows[t], j))));
+        self.decompose(Front {
+            s,
+            n,
+            p,
+            c,
+            d,
+            bw_iters,
+            bw_ok,
+            bw_res,
+            sub_spectrum,
+        })
+    }
+
+    /// Stages 4–6 on a covariance built elsewhere, e.g. streamed with
+    /// [`crate::streaming::CovAccumulator`].
+    ///
+    /// `s` is the p×p biwhitened, centred covariance of `n` cells; `c`, `d` are
+    /// the factors it was built with (reported back in the result). With
+    /// `EigensolverMode::Subsample`, pass the subsample spectrum from
+    /// [`crate::streaming::subsample_spectrum`]; it is ignored otherwise.
+    pub fn fit_covariance(
+        &self,
+        s: Mat<f64>,
+        n: usize,
+        c: Col<f64>,
+        d: Col<f64>,
+        sub_spectrum: Option<(Vec<f64>, f64)>,
+    ) -> SparsePCAResult {
+        let p = s.nrows();
+        assert_eq!(s.ncols(), p, "S must be square");
+        assert_eq!(d.nrows(), p, "d length != p");
+        assert_eq!(c.nrows(), n, "c length != n");
+        let sub_spectrum = match self.config.eigensolver {
+            EigensolverMode::Subsample { .. } => Some(
+                sub_spectrum
+                    .expect("EigensolverMode::Subsample needs sub_spectrum in fit_covariance"),
+            ),
+            _ => None,
+        };
+        self.decompose(Front {
+            s,
+            n,
+            p,
+            c,
+            d,
+            bw_iters: 0,
+            bw_ok: true,
+            bw_res: 0.0,
+            sub_spectrum,
+        })
+    }
+
+    /// Evenly spaced cell indices for `EigensolverMode::Subsample`, else `None`.
+    fn subsample_rows(&self, n: usize) -> Option<Vec<usize>> {
+        match self.config.eigensolver {
+            EigensolverMode::Subsample { n_cells } => {
+                let m = n_cells.clamp(2, n);
+                Some((0..m).map(|t| t * n / m).collect())
+            }
+            _ => None,
+        }
+    }
+
+    /// [`SparsePCA::fit`] for a sparse (CSR) cells × genes matrix.
+    ///
+    /// Stages 0–3 run on the sparse matrix: Stage 0 drops empty rows/cols,
+    /// Sinkhorn-Knopp uses sparse products, and the covariance is formed as
+    /// (YᵀY − nμμᵀ)/(n−1) with Y = diag(c) X diag(d), in Σᵢ nnzᵢ² work.
+    /// No n×p dense matrix exists at any point: memory is O(nnz + p²).
+    /// Stages 4–6 are the same code as the dense path.
+    ///
+    /// Non-convergence fallback: per-gene standardisation, as in `fit`. Here the
+    /// returned `bw_c`/`bw_d` are the factors actually applied (c = 1,
+    /// d = 1/sd); the dense path reports the unconverged Sinkhorn factors.
+    pub fn fit_csr(&self, data: &CsrMatrix) -> SparsePCAResult {
+        let v = self.config.verbose;
+        let (data, _, _) = data.drop_empty();
+        let (n, p) = (data.nrows(), data.ncols());
+        let xt = data.transpose();
+
+        if v {
+            eprint!("[biwhitening]  {n}×{p} CSR, nnz={} ... ", data.nnz());
+        }
+        let t = Instant::now();
+        let (c, d, bw_iters, bw_ok, bw_res) = match &self.config.precomputed_factors {
+            Some((c_in, d_in)) => {
+                assert_eq!(
+                    c_in.nrows(),
+                    n,
+                    "precomputed_factors c length != n (after zero-row/col filter)"
+                );
+                assert_eq!(
+                    d_in.nrows(),
+                    p,
+                    "precomputed_factors d length != p (after zero-row/col filter)"
+                );
+                (c_in.clone(), d_in.clone(), 0_usize, true, 0.0_f64)
+            }
+            None => Biwhitener {
+                max_iter: self.config.bw_max_iter,
+                damp: self.config.bw_damp,
+                ..Biwhitener::default()
+            }
+            .compute_csr_t(&data, &xt),
+        };
+        let (c, d) = if !bw_ok && bw_res > 1e-2 {
+            if v {
+                eprintln!("not converged after {bw_iters} iters (residual={bw_res:.2e}) — falling back to per-gene standardisation");
+            }
+            let sd = Col::from_fn(p, |j| {
+                let (s1, s2) = xt
+                    .row(j)
+                    .fold((0.0, 0.0), |(a, b), (_, x)| (a + x, b + x * x));
+                let mean = s1 / n as f64;
+                (s2 / n as f64 - mean * mean).max(0.0).sqrt().max(1e-10)
+            });
+            (
+                Col::from_fn(n, |_| 1.0),
+                Col::from_fn(p, |j| 1.0 / sd.read(j)),
+            )
+        } else {
+            if v {
+                eprintln!(
+                    "{bw_iters} iters, converged={bw_ok} ({:.2}s)",
+                    t.elapsed().as_secs_f64()
+                );
+            }
+            (c, d)
+        };
+
+        if v {
+            eprint!("[covariance]   sparse YᵀY − nμμᵀ  ({p}×{p}) ... ");
+        }
+        let t = Instant::now();
+        let s = data.biwhitened_covariance(&xt, &c, &d);
+        if v {
+            eprint!("done ({:.2}s)  ", t.elapsed().as_secs_f64());
+        }
+        let sub_spectrum = self.subsample_rows(n).map(|rows| {
+            let mu = data.biwhitened_mean(&xt, &c, &d);
+            gram_spectrum(&data.centred_rows(&rows, &c, &d, &mu))
+        });
+        drop((data, xt));
+
+        self.decompose(Front {
+            s,
+            n,
+            p,
+            c,
+            d,
+            bw_iters,
+            bw_ok,
+            bw_res,
+            sub_spectrum,
+        })
+    }
+
+    /// Stages 4–6 (σ², RMT threshold, FISTA), shared by the dense and CSR paths.
+    fn decompose(&self, f: Front) -> SparsePCAResult {
+        let v = self.config.verbose;
+        let Front {
+            s,
+            n,
+            p,
+            c,
+            d,
+            bw_iters,
+            bw_ok,
+            bw_res,
+            sub_spectrum,
+        } = f;
+        // q of the spectrum σ² and KS are computed from (subsample q' or full q)
+        let mut spectrum_q = p as f64 / n as f64;
+
         // --- Stage 4 / 4b: σ² estimation and eigenspectrum ---
         //
         // Two modes controlled by `config.eigensolver`:
@@ -358,6 +576,27 @@ impl SparsePCA {
                     1.0
                 };
                 (sq, raw_eigs)
+            }
+            EigensolverMode::Subsample { .. } => {
+                let (eigs, q_sub) = sub_spectrum.expect("subsample spectrum computed in front end");
+                spectrum_q = q_sub;
+                let rmt_sub = RmtTheory { q: q_sub };
+                let lplus_sub = rmt_sub.lambda_plus();
+                let mut bulk: Vec<f64> = eigs
+                    .iter()
+                    .cloned()
+                    .filter(|&e| e > 0.001 && e <= lplus_sub)
+                    .collect();
+                bulk.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+                let sq = if bulk.is_empty() {
+                    1.0
+                } else {
+                    bulk[bulk.len() / 2] / rmt_sub.mp_median()
+                };
+                if v {
+                    eprint!("[eigenspectrum] subsample Gram (q'={q_sub:.3}) ... ");
+                }
+                (sq, eigs)
             }
             EigensolverMode::Fast => {
                 // σ² ≈ Tr(S) / min(n−1, p)
@@ -478,6 +717,7 @@ impl SparsePCA {
             self.config.tolerance,
             self.config.tol_obj,
             v,
+            self.config.fista_reuse_products,
         );
         if v {
             eprintln!("[FISTA]        done ({:.2}s)", t.elapsed().as_secs_f64());
@@ -489,10 +729,10 @@ impl SparsePCA {
 
         // KS diagnostic: only available in Full mode when compute_ks = true.
         let ks_distance =
-            if self.config.compute_ks && self.config.eigensolver == EigensolverMode::Full {
+            if self.config.compute_ks && self.config.eigensolver != EigensolverMode::Fast {
                 Some(crate::verification::calculate_bulk_ks(
                     &s_eigenvalues,
-                    rmt.q,
+                    spectrum_q,
                 ))
             } else {
                 None
@@ -501,6 +741,17 @@ impl SparsePCA {
         // P2.B: expose biwhitening factors as plain Vec<f64> for ergonomic
         // (de)serialisation by callers.
         let bw_c: Vec<f64> = (0..c.nrows()).map(|i| c.read(i)).collect();
+        let bw_d_tmp: Vec<f64> = (0..d.nrows()).map(|j| d.read(j)).collect();
+        let (collapsed_cells, max_gene_factor_ratio) = biwhitening_collapse(&bw_c, &bw_d_tmp);
+        if v && collapsed_cells > 0 {
+            eprintln!(
+                "[biwhitening]  WARNING: {collapsed_cells} cells collapsed (c < 1e-3·median), \
+                 max d/median = {max_gene_factor_ratio:.1e}: genes detected in too few cells \
+                 (≲ n/p = {:.1}) have no finite biwhitening. Keep genes in ≳ {:.0} cells.",
+                n as f64 / p as f64,
+                (2.0 * n as f64 / p as f64).ceil()
+            );
+        }
         let bw_d: Vec<f64> = (0..d.nrows()).map(|j| d.read(j)).collect();
 
         SparsePCAResult {
@@ -518,6 +769,8 @@ impl SparsePCA {
             bw_d,
             s_eigenvalues_unrescaled,
             top_eigenvectors,
+            collapsed_cells,
+            max_gene_factor_ratio,
         }
     }
 }
@@ -575,6 +828,36 @@ pub struct SparsePCAResult {
     /// (after Stage 0 filter). Length = `config.top_eigvec_count` (default 20),
     /// capped to p. Empty in `Fast` mode.
     pub top_eigenvectors: Vec<Vec<f64>>,
+    /// Cells whose biwhitening factor collapsed: c_i < 1e-3 · median(c).
+    ///
+    /// Non-zero means Sinkhorn had no finite solution and drifted c_i → 0,
+    /// d_j → ∞, erasing those cells (see [`biwhitening_collapse`]). Healthy
+    /// runs have min(c)/median(c) ≈ 0.1, so the threshold is far from normal.
+    pub collapsed_cells: usize,
+    /// max(d) / median(d). Healthy runs: ~10–100; a collapse shows as ≫ 1e3.
+    pub max_gene_factor_ratio: f64,
+}
+
+/// Biwhitening collapse diagnostic: (cells with c_i < 1e-3·median(c),
+/// max(d)/median(d)).
+///
+/// A gene detected in k cells (counts ≈ 1) needs (c_i d_j)² ≈ n/k for unit
+/// variance, which spends n/(k·p) of each such cell's unit row variance. When
+/// that exceeds 1 — roughly k < n/p, or several rare genes in one cell — no
+/// finite factors exist; Sinkhorn drifts c_i → 0, d_j → ∞ while X_w's variances,
+/// its stopping rule, barely move. The cells are erased from the covariance.
+/// Rare cell types carrying rare genes are hit first. Remedy: keep genes
+/// detected in ≳ 2–3·n/p cells (a detection filter, not variance-based).
+pub fn biwhitening_collapse(c: &[f64], d: &[f64]) -> (usize, f64) {
+    let median = |v: &[f64]| {
+        let mut s = v.to_vec();
+        s.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+        s[s.len() / 2]
+    };
+    let (mc, md) = (median(c), median(d));
+    let cells = c.iter().filter(|&&x| x < 1e-3 * mc).count();
+    let ratio = d.iter().cloned().fold(0.0, f64::max) / md;
+    (cells, ratio)
 }
 
 // ---------------------------------------------------------------------------
@@ -607,19 +890,28 @@ pub(crate) fn fista_sparse_pca(
     tol: f64,
     tol_obj: f64,
     verbose: bool,
+    reuse_products: bool,
 ) -> Mat<f64> {
     let (p, k) = (v_init.nrows(), v_init.ncols());
     let mut w = v_init.clone();
     let mut y = v_init.clone();
     let mut t = 1.0_f64;
 
-    let mut obj_prev = trace_wt_s_w(s, v_init);
+    // S·W for the current W; with `reuse_products` also S·Y (see FistaConfig).
+    let mut sw = mat_mul(s, v_init);
+    let mut obj_prev = trace_with(v_init, &sw);
+    let mut sy_next = sw.clone();
 
     for iter in 0..max_iter {
         let prev_w = w.clone();
+        let s_prev_w = sw;
 
         // Step 1: gradient ascent  Z = Y + 2γ S Y
-        let sy = mat_mul(s, &y);
+        let sy = if reuse_products {
+            sy_next
+        } else {
+            mat_mul(s, &y)
+        };
         let mut z = Mat::from_fn(p, k, |i, j| y.read(i, j) + 2.0 * gamma * sy.read(i, j));
 
         // Step 2: soft-threshold (proximal operator of λ‖·‖₁)
@@ -644,7 +936,8 @@ pub(crate) fn fista_sparse_pca(
         z = orthonormalize(&z);
 
         // Stopping criteria
-        let obj_new = trace_wt_s_w(s, &z);
+        let sz = mat_mul(s, &z);
+        let obj_new = trace_with(&z, &sz);
         let dw = frobenius_diff(&z, &prev_w, p, k);
         let dvar = (obj_new - obj_prev).abs();
         let iterate_ok = dw < tol;
@@ -684,16 +977,24 @@ pub(crate) fn fista_sparse_pca(
         y = Mat::from_fn(p, k, |i, j| {
             z.read(i, j) + beta * (z.read(i, j) - prev_w.read(i, j))
         });
+        // S·Y by linearity from S·Z and S·W_prev (only used with reuse_products)
+        sy_next = if reuse_products {
+            Mat::from_fn(p, k, |i, j| {
+                sz.read(i, j) + beta * (sz.read(i, j) - s_prev_w.read(i, j))
+            })
+        } else {
+            Mat::new()
+        };
         w = z;
+        sw = sz;
         t = next_t;
     }
 
     w
 }
 
-/// Tr(W^T S W) — total variance explained by loading matrix W.
-fn trace_wt_s_w(s: &Mat<f64>, w: &Mat<f64>) -> f64 {
-    let sw = mat_mul(s, w);
+/// Tr(W^T S W) — total variance explained by loading matrix W, given SW.
+fn trace_with(w: &Mat<f64>, sw: &Mat<f64>) -> f64 {
     let (p, k) = (w.nrows(), w.ncols());
     let mut acc = 0.0_f64;
     for i in 0..p {
@@ -707,6 +1008,18 @@ fn trace_wt_s_w(s: &Mat<f64>, w: &Mat<f64>) -> f64 {
 // ---------------------------------------------------------------------------
 // Linear algebra helpers
 // ---------------------------------------------------------------------------
+
+/// Eigenvalues (ascending) of the Gram Y Yᵀ/(m−1) of an m×p centred row block,
+/// i.e. the non-zero spectrum of the block's covariance, with q' = p/m.
+pub(crate) fn gram_spectrum(y: &Mat<f64>) -> (Vec<f64>, f64) {
+    let (m, p) = (y.nrows(), y.ncols());
+    let inv = 1.0 / (m - 1) as f64;
+    let g: Mat<f64> = y.as_ref() * y.as_ref().transpose();
+    let g = Mat::from_fn(m, m, |i, j| g.read(i, j) * inv);
+    let mut eigs = g.selfadjoint_eigenvalues(Side::Lower);
+    eigs.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+    (eigs, p as f64 / m as f64)
+}
 
 /// Dense matrix product C = A B  (BLAS-backed via faer).
 fn mat_mul(a: &Mat<f64>, b: &Mat<f64>) -> Mat<f64> {
@@ -808,9 +1121,10 @@ mod tests {
         let lmax = 3.01_f64;
         let gamma = 1.0 / (2.0 * lmax);
 
-        let w = fista_sparse_pca(&s, &v_init, gamma, 0.0, 500, 1e-8, 1e-8, false);
-
-        let dot: f64 = (0..p).map(|i| w.read(i, 0) * v0[i]).sum::<f64>();
-        assert!(dot.abs() > 0.99, "alignment = {dot}");
+        for reuse in [false, true] {
+            let w = fista_sparse_pca(&s, &v_init, gamma, 0.0, 500, 1e-8, 1e-8, false, reuse);
+            let dot: f64 = (0..p).map(|i| w.read(i, 0) * v0[i]).sum::<f64>();
+            assert!(dot.abs() > 0.99, "alignment = {dot} (reuse={reuse})");
+        }
     }
 }

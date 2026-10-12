@@ -1,5 +1,63 @@
 use faer::{Col, Mat};
 
+use crate::sparse::CsrMatrix;
+
+/// The four products Sinkhorn-Knopp needs: X v, Xᵀ v, U v, Uᵀ v with U = X∘X.
+/// Dense and sparse inputs share one iteration through this.
+trait BwOps {
+    fn shape(&self) -> (usize, usize);
+    fn x_v(&self, v: &Col<f64>) -> Col<f64>;
+    fn xt_v(&self, v: &Col<f64>) -> Col<f64>;
+    fn u_v(&self, v: &Col<f64>) -> Col<f64>;
+    fn ut_v(&self, v: &Col<f64>) -> Col<f64>;
+}
+
+struct DenseOps<'a> {
+    x: &'a Mat<f64>,
+    u: Mat<f64>,
+}
+
+impl BwOps for DenseOps<'_> {
+    fn shape(&self) -> (usize, usize) {
+        (self.x.nrows(), self.x.ncols())
+    }
+    fn x_v(&self, v: &Col<f64>) -> Col<f64> {
+        self.x.as_ref() * v.as_ref()
+    }
+    fn xt_v(&self, v: &Col<f64>) -> Col<f64> {
+        self.x.as_ref().transpose() * v.as_ref()
+    }
+    fn u_v(&self, v: &Col<f64>) -> Col<f64> {
+        self.u.as_ref() * v.as_ref()
+    }
+    fn ut_v(&self, v: &Col<f64>) -> Col<f64> {
+        self.u.as_ref().transpose() * v.as_ref()
+    }
+}
+
+struct CsrOps<'a> {
+    x: &'a CsrMatrix,
+    xt: &'a CsrMatrix,
+}
+
+impl BwOps for CsrOps<'_> {
+    fn shape(&self) -> (usize, usize) {
+        (self.x.nrows(), self.x.ncols())
+    }
+    fn x_v(&self, v: &Col<f64>) -> Col<f64> {
+        self.x.mul_vec(v, false)
+    }
+    fn xt_v(&self, v: &Col<f64>) -> Col<f64> {
+        self.xt.mul_vec(v, false)
+    }
+    fn u_v(&self, v: &Col<f64>) -> Col<f64> {
+        self.x.mul_vec(v, true)
+    }
+    fn ut_v(&self, v: &Col<f64>) -> Col<f64> {
+        self.xt.mul_vec(v, true)
+    }
+}
+
 /// Algorithm 1 from Chardès et al.: Sinkhorn-Knopp biwhitening.
 ///
 /// Finds diagonal scaling vectors c ∈ ℝⁿ (cells) and d ∈ ℝᵖ (genes) such
@@ -73,10 +131,27 @@ impl Biwhitener {
     /// - `converged` — true iff the change of |Var(X_w) − 1| fell below `tol`
     /// - `residual`  — that change at the last iteration
     pub fn compute(&self, x: &Mat<f64>) -> (Col<f64>, Col<f64>, usize, bool, f64) {
-        let (n, p) = (x.nrows(), x.ncols());
-
         // U_ij = x²_ij  (Algorithm 1, line 3)
-        let u = Mat::from_fn(n, p, |i, j| x.read(i, j).powi(2));
+        let u = Mat::from_fn(x.nrows(), x.ncols(), |i, j| x.read(i, j).powi(2));
+        self.iterate(&DenseOps { x, u })
+    }
+
+    /// [`Biwhitener::compute`] for a CSR matrix; U = X∘X is never materialised.
+    pub fn compute_csr(&self, x: &CsrMatrix) -> (Col<f64>, Col<f64>, usize, bool, f64) {
+        self.compute_csr_t(x, &x.transpose())
+    }
+
+    /// As [`Biwhitener::compute_csr`] with a precomputed transpose `xt` = Xᵀ.
+    pub(crate) fn compute_csr_t(
+        &self,
+        x: &CsrMatrix,
+        xt: &CsrMatrix,
+    ) -> (Col<f64>, Col<f64>, usize, bool, f64) {
+        self.iterate(&CsrOps { x, xt })
+    }
+
+    fn iterate(&self, ops: &impl BwOps) -> (Col<f64>, Col<f64>, usize, bool, f64) {
+        let (n, p) = ops.shape();
 
         let mut c = Col::from_fn(n, |_| 1.0_f64);
         let mut d = Col::from_fn(p, |_| 1.0_f64);
@@ -87,8 +162,8 @@ impl Biwhitener {
         let mut gene_dev = vec![0.0_f64; p];
         let mut cell_dev = vec![0.0_f64; n];
         // (X^T c)_j = Σᵢ cᵢ xᵢⱼ and (U^T c²)_j = Σᵢ c²ᵢ x²ᵢⱼ  — BLAS gemv
-        let mut x_t_c: Col<f64> = x.as_ref().transpose() * c.as_ref();
-        let mut u_t_c2: Col<f64> = u.as_ref().transpose() * c.as_ref(); // c = 1, so c² = c
+        let mut x_t_c: Col<f64> = ops.xt_v(&c);
+        let mut u_t_c2: Col<f64> = ops.ut_v(&c); // c = 1, so c² = c
         for _ in 0..self.max_iter {
             iters += 1;
             let prev_c = c.clone();
@@ -113,9 +188,9 @@ impl Biwhitener {
             // --- Update c (cell-wise scaling, Algorithm 1 line 7) ---
             let d2 = Col::from_fn(p, |j| d.read(j).powi(2));
             // (X d)_i = Σⱼ dⱼ xᵢⱼ  — BLAS gemv
-            let x_d: Col<f64> = x.as_ref() * d.as_ref();
+            let x_d: Col<f64> = ops.x_v(&d);
             // (U d²)_i = Σⱼ d²ⱼ x²ᵢⱼ  — BLAS gemv
-            let u_d2: Col<f64> = u.as_ref() * d2.as_ref();
+            let u_d2: Col<f64> = ops.u_v(&d2);
             // c_i = √[ p · (1 + (c_i · (X d)_i / p)²) / (U d²)_i ]
             // Guard: all-zero cell row → keep c_i = 1.
             c = Col::from_fn(n, |i| {
@@ -133,8 +208,8 @@ impl Biwhitener {
             // Gene variances need the new c; those two gemvs are also what the
             // next d update needs, so they are not extra work.
             let c2 = Col::from_fn(n, |i| c.read(i).powi(2));
-            x_t_c = x.as_ref().transpose() * c.as_ref();
-            u_t_c2 = u.as_ref().transpose() * c2.as_ref();
+            x_t_c = ops.xt_v(&c);
+            u_t_c2 = ops.ut_v(&c2);
             let mut change = 0.0_f64;
             for (j, prev) in gene_dev.iter_mut().enumerate() {
                 let dj = d.read(j);

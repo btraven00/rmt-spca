@@ -53,10 +53,37 @@ Key `FistaConfig` fields:
 |-------|---------|-------------|
 | `lambda_frac` | `None` | λ = frac × λ+; overrides `lambda`; ~0.3 targets 200–500 genes/component |
 | `lambda` | `0.1` | L1 penalty (absolute); ignored when `lambda_frac` is set |
-| `eigensolver` | `Full` | `EigensolverMode::Full` (exact) or `::Fast` (approximate, 4× faster) |
+| `eigensolver` | `Full` | `EigensolverMode::Full` (exact), `::Fast` (approximate, 4× faster), or `::Subsample { n_cells }` (σ²/KS from an m×m Gram of m cells) |
+| `k_max` | `20` | Ceiling on signal components; raise when k saturates it |
+| `fista_reuse_products` | `false` | One S-product per FISTA iteration instead of two (equal in exact arithmetic) |
 | `compute_ks` | `true` | Compute KS goodness-of-fit; only available with `Full` eigensolver |
 | `bw_max_iter` | `1000` | Max Sinkhorn-Knopp iterations |
 | `bw_damp` | `1.0` | Sinkhorn under-relaxation ∈ (0,1]; not needed for convergence, only slows it |
+
+## Sparse and streaming input
+
+Defaults are unchanged and bit-identical to the dense pipeline. Opt-in paths:
+
+- **`SparsePCA::fit_csr(&CsrMatrix)`** — stages 0–3 on a CSR matrix: sparse
+  Sinkhorn, covariance as (YᵀY − nμμᵀ)/(n−1) in Σᵢ nnzᵢ² work. No n×p dense
+  matrix; memory O(nnz + p²). Matches `fit` to ~1e-15 on real data.
+- **`EigensolverMode::Subsample { n_cells }`** — σ² and KS from the exact
+  spectrum of m evenly spaced cells via their m×m Gram (O(m²p + m³) instead of
+  O(p³)). With m ≥ n it reproduces `Full`; with m < n σ² is an estimate (a few
+  % on small fixtures), and components within that margin of λ+ can flip.
+- **Streaming** (`rmt_spca::streaming`): Sinkhorn on a cell subsample for `d`,
+  full-data refinement passes (`cell_factors` + `GeneMoments`), one pass of
+  `CovAccumulator`, then `SparsePCA::fit_covariance`. Memory O(p² + block).
+  The `rmt-spca-io` CLI exposes this as `--stream-block`.
+
+**Check `collapsed_cells` when n ≳ p.** Genes detected in fewer than ~n/p
+cells make biwhitening infeasible; Sinkhorn then erases the cells expressing
+them (5% of Zheng 94k with a ≥3-cell gene filter). Filter genes to ≥ 3·n/p
+cells — see [docs/biwhitening-degeneracy.md](docs/biwhitening-degeneracy.md).
+
+`tests/sparse_precision.rs` checks each path against the dense one stage by
+stage (factors, covariance, spectrum, σ², k, components), plus the accuracy of
+the eigendecomposition itself (residuals, orthonormality, trace, PSD).
 
 ## Output
 

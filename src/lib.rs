@@ -32,5 +32,7 @@
 pub mod biwhitening;
 pub mod markers;
 pub mod rmt;
+pub mod sparse;
 pub mod spca;
+pub mod streaming;
 pub mod verification;
