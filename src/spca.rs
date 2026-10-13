@@ -83,6 +83,16 @@ pub struct FistaConfig {
     /// Typical range: 0.1–1.0 × λ+.  The paper's "200–500 genes/component"
     /// target corresponds to roughly 0.3–0.7 × λ+ on Zheng2017.
     pub lambda_frac: Option<f64>,
+    /// **Eq. 8 penalty selection** (the paper's procedure; overrides `lambda`
+    /// and `lambda_frac` when set). `Some(scale)` root-finds λ* such that the
+    /// distance between the sparse subspace W and the outlier eigenspace V,
+    /// `Σ_j (1 − σ_j²)` with σ_j the singular values of WᵀV, equals the
+    /// RMT-predicted `Σ_j (1 − overlap_j)` (BBP squared overlaps of the k
+    /// retained components), then fits at `scale × λ*`. The reference uses
+    /// `scale = 0.6`. Each root-finding step is one FISTA run (~8–12 steps),
+    /// so this costs about ten fits. See PLAN.md: a fixed `lambda_frac` has no
+    /// relation to the spectrum and collapses components to single genes.
+    pub auto_penalty: Option<f64>,
     /// Print per-stage timing and FISTA progress to stderr.
     pub verbose: bool,
     /// Maximum Sinkhorn-Knopp iterations for biwhitening (default 1000).
@@ -140,6 +150,7 @@ impl Default for FistaConfig {
             tol_obj: 1e-6,
             lambda: 0.1,
             lambda_frac: None,
+            auto_penalty: None,
             verbose: false,
             bw_max_iter: 1000,
             bw_damp: 1.0,
@@ -698,9 +709,45 @@ impl SparsePCA {
         } else {
             0.25
         };
-        let lambda = match self.config.lambda_frac {
-            Some(frac) => frac * lambda_plus,
-            None => self.config.lambda,
+        // Eq. 8 target: Σ_j (1 − predicted overlap) over the k retained
+        // components, the overlap being the BBP squared cosine between the
+        // signal eigenvector and the outlier eigenvector. A component at or
+        // below λ+ has no prediction and counts as fully unresolved (1).
+        let target_distance: f64 = rq[..k]
+            .iter()
+            .map(|&r| {
+                if r > lambda_plus {
+                    1.0 - rmt.predicted_overlap(r).clamp(0.0, 1.0)
+                } else {
+                    1.0
+                }
+            })
+            .sum();
+        let run = |lambda: f64, verbose: bool| {
+            fista_sparse_pca(
+                &s,
+                &v_init,
+                gamma,
+                lambda,
+                self.config.max_iterations,
+                self.config.tolerance,
+                self.config.tol_obj,
+                verbose,
+                self.config.fista_reuse_products,
+            )
+        };
+        let (lambda, lambda_star) = match (self.config.auto_penalty, self.config.lambda_frac) {
+            (Some(scale), _) => {
+                let star = select_penalty_eq8(
+                    |lam| subspace_distance(&run(lam, false), &v_init),
+                    target_distance,
+                    lambda_plus,
+                    v,
+                );
+                (scale * star, Some(star))
+            }
+            (None, Some(frac)) => (frac * lambda_plus, None),
+            (None, None) => (self.config.lambda, None),
         };
         if v {
             eprintln!("[FISTA]        λ = {lambda:.4e}  γ = {gamma:.4e}  (γλ = {:.4e})  max_iter = {}  tol = {}  tol_obj = {}",
@@ -708,19 +755,33 @@ impl SparsePCA {
             self.config.tolerance, self.config.tol_obj);
         }
         let t = Instant::now();
-        let components = fista_sparse_pca(
-            &s,
-            &v_init,
-            gamma,
-            lambda,
-            self.config.max_iterations,
-            self.config.tolerance,
-            self.config.tol_obj,
-            v,
-            self.config.fista_reuse_products,
-        );
+        let components = run(lambda, v);
+        let subspace_distance = subspace_distance(&components, &v_init);
+        let singletons = (0..k)
+            .filter(|&j| {
+                (0..p)
+                    .map(|i| components.read(i, j).abs())
+                    .fold(0.0, f64::max)
+                    > 0.9
+            })
+            .count();
         if v {
-            eprintln!("[FISTA]        done ({:.2}s)", t.elapsed().as_secs_f64());
+            eprintln!(
+                "[FISTA]        done ({:.2}s)  subspace distance Σ(1−σ²) = {subspace_distance:.3} \
+                 (Eq. 8 target {target_distance:.3}){}",
+                t.elapsed().as_secs_f64(),
+                match lambda_star {
+                    Some(star) => format!("  λ* = {star:.4e}"),
+                    None => String::new(),
+                }
+            );
+            if singletons > 0 {
+                eprintln!(
+                    "[FISTA]        WARNING: {singletons}/{k} components collapsed onto a single gene \
+                     (max|w| > 0.9): the penalty is too large for them. Use `auto_penalty` (Eq. 8) \
+                     or lower λ; see PLAN.md."
+                );
+            }
         }
 
         // Rayleigh quotients for the k signal components (used in validate.rs
@@ -758,6 +819,10 @@ impl SparsePCA {
             components,
             eigenvalues,
             s_eigenvalues,
+            lambda,
+            lambda_star,
+            subspace_distance,
+            target_distance,
             lambda_plus,
             q: rmt.q,
             sigma_sq,
@@ -787,6 +852,18 @@ pub struct SparsePCAResult {
     /// Empty when `EigensolverMode::Fast` is used.
     /// Used for the Kolmogorov-Smirnov test against the MP distribution.
     pub s_eigenvalues: Vec<f64>,
+    /// L1 penalty actually used by FISTA (absolute, covariance-eigenvalue units).
+    pub lambda: f64,
+    /// Eq. 8 root λ* when `FistaConfig::auto_penalty` was set (`lambda` is
+    /// then `scale × lambda_star`); `None` for a fixed `lambda` / `lambda_frac`.
+    pub lambda_star: Option<f64>,
+    /// Achieved distance Σ_j (1 − σ_j²) between the sparse subspace and the
+    /// outlier eigenspace (σ_j = singular values of WᵀV). 0 = W spans V.
+    pub subspace_distance: f64,
+    /// RMT-predicted distance Σ_j (1 − overlap_j) over the k components (Eq. 8
+    /// target). A `subspace_distance` far above it means over-penalised;
+    /// each single-gene component adds ≈ 1.
+    pub target_distance: f64,
     /// MP bulk edge λ+ = (1 + √q)² computed from the *filtered* (n, p).
     pub lambda_plus: f64,
     /// Aspect ratio q = p/n used for RMT, after zero-row/col filtering.
@@ -993,6 +1070,69 @@ pub(crate) fn fista_sparse_pca(
     w
 }
 
+/// Distance Σ_j (1 − σ_j²) between the column spaces of W and V (both p×k with
+/// orthonormal columns), σ_j the singular values of WᵀV. Since Σ σ_j² = ‖WᵀV‖_F²
+/// this needs no SVD. 0 when W spans V; each column of W orthogonal to V adds 1.
+pub fn subspace_distance(w: &Mat<f64>, v: &Mat<f64>) -> f64 {
+    let z = w.as_ref().transpose() * v.as_ref();
+    let fro2: f64 = (0..z.nrows())
+        .flat_map(|i| (0..z.ncols()).map(move |j| (i, j)))
+        .map(|(i, j)| z.read(i, j).powi(2))
+        .sum();
+    w.ncols() as f64 - fro2
+}
+
+/// Eq. 8 penalty selection (paper's `_adjust_penalty`): the λ* at which
+/// `distance(λ) = target`, where `distance` runs FISTA at λ and measures the
+/// subspace distance to the outlier eigenspace. Bisection on log λ, since the
+/// distance is monotone in λ up to solver noise: 0 at λ → 0 (dense
+/// eigenvectors) and ≈ k once every column has collapsed. Bracket
+/// [1e-4, λ+], widened upward if needed; stops at 5 % relative width.
+pub fn select_penalty_eq8<F: Fn(f64) -> f64>(
+    distance: F,
+    target: f64,
+    lambda_plus: f64,
+    verbose: bool,
+) -> f64 {
+    let mut evals = 0usize;
+    let mut f = |lam: f64| {
+        let d = distance(lam) - target;
+        evals += 1;
+        if verbose {
+            eprintln!("[Eq. 8]        eval {evals:>2}  λ = {lam:.4e}  distance − target = {d:+.4}");
+        }
+        d
+    };
+    let mut lo = 1e-4_f64;
+    let mut hi = lambda_plus.max(1e-3);
+    if f(lo) >= 0.0 {
+        if verbose {
+            eprintln!("[Eq. 8]        distance already at/above target at λ = {lo:.1e}; using it");
+        }
+        return lo;
+    }
+    let mut f_hi = f(hi);
+    while f_hi < 0.0 && hi < 64.0 * lambda_plus {
+        hi *= 2.0;
+        f_hi = f(hi);
+    }
+    if f_hi < 0.0 {
+        if verbose {
+            eprintln!("[Eq. 8]        target not reached by λ = {hi:.3e}; using it");
+        }
+        return hi;
+    }
+    while hi / lo > 1.05 {
+        let mid = (lo * hi).sqrt();
+        if f(mid) < 0.0 {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    (lo * hi).sqrt()
+}
+
 /// Tr(W^T S W) — total variance explained by loading matrix W, given SW.
 fn trace_with(w: &Mat<f64>, sw: &Mat<f64>) -> f64 {
     let (p, k) = (w.nrows(), w.ncols());
@@ -1073,7 +1213,18 @@ fn orthonormalize(a: &Mat<f64>) -> Mat<f64> {
 /// quotients for the BBP threshold test.
 fn subspace_iteration(s: &Mat<f64>, k: usize, n_iter: usize) -> Mat<f64> {
     let p = s.nrows();
-    let mut v = Mat::from_fn(p, k, |i, j| if i == j { 1.0 } else { 0.0 });
+    // Deterministic pseudo-random start (xorshift64). The previous start, the
+    // first k coordinate vectors, has zero overlap with any signal direction
+    // supported outside genes 0..k, so on a block-structured covariance the
+    // iteration never finds it (a 3-spike test found 1 spike). Column order
+    // and hence the eigenvector ordering do not depend on the start.
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+    let mut v = Mat::from_fn(p, k, |_, _| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 11) as f64 / (1u64 << 53) as f64 - 0.5
+    });
     for _ in 0..n_iter {
         let sv = mat_mul(s, &v);
         v = orthonormalize(&sv);
@@ -1104,6 +1255,245 @@ mod tests {
                 assert!((dot - expected).abs() < 1e-12, "q^T q [{i},{j}] = {dot}");
             }
         }
+    }
+
+    #[test]
+    fn subspace_distance_is_zero_for_same_span_and_one_per_orthogonal_column() {
+        let v = Mat::from_fn(4, 2, |i, j| if i == j { 1.0 } else { 0.0 });
+        assert!(subspace_distance(&v, &v).abs() < 1e-12);
+        // rotate within the span: still 0
+        let r = Mat::from_fn(4, 2, |i, j| match (i, j) {
+            (0, 0) | (1, 1) => 0.6,
+            (1, 0) => 0.8,
+            (0, 1) => -0.8,
+            _ => 0.0,
+        });
+        assert!(subspace_distance(&r, &v).abs() < 1e-12);
+        // one column outside the span: distance 1
+        let w = Mat::from_fn(4, 2, |i, j| {
+            if (i, j) == (0, 0) || (i, j) == (2, 1) {
+                1.0
+            } else {
+                0.0
+            }
+        });
+        assert!((subspace_distance(&w, &v) - 1.0).abs() < 1e-12);
+    }
+
+    /// Spiked covariance used by the Eq. 8 tests: three signal directions on
+    /// disjoint 60-gene supports with eigenvalues 40, 12, 4 above unit noise.
+    fn spiked_three(p: usize) -> (Mat<f64>, Mat<f64>) {
+        let mut rng = 12345u64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            (rng % 10_000) as f64 / 10_000.0
+        };
+        let supports = [(0usize, 60usize), (70, 130), (140, 200)];
+        let spikes = [40.0, 12.0, 4.0];
+        let mut u = Mat::<f64>::zeros(p, 3);
+        for (j, &(a, b)) in supports.iter().enumerate() {
+            let mut col: Vec<f64> = (a..b).map(|_| 0.5 + next()).collect();
+            let nrm: f64 = col.iter().map(|x| x * x).sum::<f64>().sqrt();
+            col.iter_mut().for_each(|x| *x /= nrm);
+            for (t, i) in (a..b).enumerate() {
+                u.as_mut().write(i, j, col[t]);
+            }
+        }
+        let s = Mat::from_fn(p, p, |i, j| {
+            let sig: f64 = (0..3)
+                .map(|c| spikes[c] * u.read(i, c) * u.read(j, c))
+                .sum();
+            sig + if i == j { 1.0 } else { 0.0 }
+        });
+        (s, u)
+    }
+
+    fn max_abs_col(w: &Mat<f64>, j: usize) -> f64 {
+        (0..w.nrows())
+            .map(|i| w.read(i, j).abs())
+            .fold(0.0, f64::max)
+    }
+
+    #[test]
+    fn eq8_root_hits_target_and_sits_on_the_collapse_cliff() {
+        let p = 200;
+        let (s, _) = spiked_three(p);
+        let gamma = 0.5 / (2.0 * 41.0);
+        let v_init = subspace_iteration(&s, 3, 200);
+        let target = 0.3;
+        let fista =
+            |lam: f64| fista_sparse_pca(&s, &v_init, gamma, lam, 2000, 1e-7, 1e-9, false, false);
+        let distance = |lam: f64| subspace_distance(&fista(lam), &v_init);
+        let star = select_penalty_eq8(distance, target, 2.0, false);
+        let achieved = distance(star);
+        assert!(
+            (achieved - target).abs() < 0.08,
+            "achieved {achieved} vs target {target} at λ*={star}"
+        );
+        // The distance is a cliff in λ: ~0 (dense eigenvectors) below the
+        // root, collapsing columns above it. That is why the reference fits
+        // at 0.6 λ*, not at λ*. Below the cliff every column stays spread;
+        // well above it the weakest spike is a single gene.
+        let w_scaled = fista(0.6 * star);
+        assert!(
+            (0..3).all(|j| max_abs_col(&w_scaled, j) < 0.5),
+            "0.6 λ* must keep all columns spread"
+        );
+        assert!(subspace_distance(&w_scaled, &v_init) < target);
+        let w_big = fista(3.0 * star);
+        assert!(
+            max_abs_col(&w_big, 2) > 0.9,
+            "expected the weakest spike to collapse at 3 λ*"
+        );
+    }
+
+    #[test]
+    fn auto_penalty_through_fit_covariance_reports_and_avoids_singletons() {
+        let (p, n) = (200usize, 1000usize);
+        let (s, u) = spiked_three(p);
+        let fixed = SparsePCA::new(FistaConfig {
+            lambda_frac: Some(1.0),
+            k_max: 8,
+            compute_ks: false,
+            ..FistaConfig::default()
+        })
+        .fit_covariance(
+            s.clone(),
+            n,
+            Col::from_fn(n, |_| 1.0),
+            Col::from_fn(p, |_| 1.0),
+            None,
+        );
+        let auto = SparsePCA::new(FistaConfig {
+            auto_penalty: Some(0.6),
+            k_max: 8,
+            compute_ks: false,
+            ..FistaConfig::default()
+        })
+        .fit_covariance(
+            s,
+            n,
+            Col::from_fn(n, |_| 1.0),
+            Col::from_fn(p, |_| 1.0),
+            None,
+        );
+        assert_eq!(
+            auto.eigenvalues.len(),
+            3,
+            "RMT should retain the three spikes"
+        );
+        assert!(fixed.lambda_star.is_none() && auto.lambda_star.is_some());
+        let star = auto.lambda_star.unwrap();
+        assert!((auto.lambda - 0.6 * star).abs() < 1e-12);
+        assert!(
+            auto.subspace_distance <= auto.target_distance + 0.05,
+            "{} vs {}",
+            auto.subspace_distance,
+            auto.target_distance
+        );
+        // fixed λ = λ+ collapses at least the weakest spike; Eq. 8 collapses none
+        let k = auto.components.ncols();
+        let singles = |w: &Mat<f64>| (0..k).filter(|&j| max_abs_col(w, j) > 0.9).count();
+        assert!(
+            singles(&fixed.components) >= 1,
+            "fixed λ+ did not collapse anything; test is too weak"
+        );
+        assert_eq!(
+            singles(&auto.components),
+            0,
+            "Eq. 8 run has single-gene components"
+        );
+        // and each Eq. 8 component lives on the support of its spike
+        for j in 0..k {
+            let on: f64 = (0..p)
+                .map(|i| auto.components.read(i, j).abs() * (u.read(i, j) > 0.0) as u8 as f64)
+                .sum();
+            let all: f64 = (0..p).map(|i| auto.components.read(i, j).abs()).sum();
+            assert!(
+                on / all > 0.95,
+                "component {j} leaks off its support: {on}/{all}"
+            );
+        }
+    }
+
+    #[test]
+    fn subspace_iteration_finds_spikes_on_disjoint_supports() {
+        let (s, u) = spiked_three(200);
+        let v = subspace_iteration(&s, 3, 300);
+        let sv = &s * &v;
+        for j in 0..3 {
+            let rq: f64 = (0..200).map(|i| v.read(i, j) * sv.read(i, j)).sum();
+            let cos: f64 = (0..200)
+                .map(|i| v.read(i, j) * u.read(i, j))
+                .sum::<f64>()
+                .abs();
+            assert!((rq - [41.0, 13.0, 5.0][j]).abs() < 1e-6, "rq[{j}] = {rq}");
+            assert!(cos > 0.999, "column {j} is not the spike: |cos| = {cos}");
+        }
+    }
+
+    /// Cross-validation of the Eq. 8 root against the Python reference
+    /// (`scripts/generate_eq8_vector.py` ports `_adjust_penalty`'s root-find
+    /// and `_fista_spca` onto `test_vectors/spiked_model.json`).
+    #[test]
+    fn eq8_root_matches_python_reference() {
+        #[derive(serde::Deserialize)]
+        struct Vec8 {
+            k: usize,
+            target: f64,
+            gamma_star: f64,
+            distance_at_star: f64,
+        }
+        #[derive(serde::Deserialize)]
+        struct Spiked {
+            #[serde(rename = "X")]
+            x: Vec<Vec<f64>>,
+        }
+        let v8: Vec8 = serde_json::from_str(
+            &std::fs::read_to_string("test_vectors/eq8_penalty.json").unwrap(),
+        )
+        .unwrap();
+        let sp: Spiked = serde_json::from_str(
+            &std::fs::read_to_string("test_vectors/spiked_model.json").unwrap(),
+        )
+        .unwrap();
+        let (n, p) = (sp.x.len(), sp.x[0].len());
+        let x = Mat::from_fn(n, p, |i, j| sp.x[i][j]);
+        let s = sample_covariance(&x);
+        let v_init = subspace_iteration(&s, v8.k, 500);
+        let sv = mat_mul(&s, &v_init);
+        let lmax = (0..v8.k)
+            .map(|j| {
+                (0..p)
+                    .map(|i| v_init.read(i, j) * sv.read(i, j))
+                    .sum::<f64>()
+            })
+            .fold(0.0, f64::max);
+        let gamma = 0.5 / (2.0 * lmax);
+        // reference stopping rule: ‖ΔW‖_F < 1e-3 only (tol_obj = 0 disables the objective test)
+        let distance = |lam: f64| {
+            subspace_distance(
+                &fista_sparse_pca(&s, &v_init, gamma, lam, 10_000, 1e-3, 0.0, false, false),
+                &v_init,
+            )
+        };
+        let star = select_penalty_eq8(distance, v8.target, 2.25, false);
+        let rel = (star - v8.gamma_star).abs() / v8.gamma_star;
+        assert!(
+            rel < 0.15,
+            "crate λ* = {star}, reference γ* = {} ({:.0}% off)",
+            v8.gamma_star,
+            100.0 * rel
+        );
+        let d = distance(star);
+        assert!(
+            (d - v8.target).abs() < 0.05,
+            "distance at λ* = {d}, target {}, reference achieved {}",
+            v8.target,
+            v8.distance_at_star
+        );
     }
 
     #[test]
