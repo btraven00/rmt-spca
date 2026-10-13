@@ -12,7 +12,7 @@
 use faer::{Col, Mat};
 use rmt_spca::biwhitening::Biwhitener;
 use rmt_spca::sparse::CsrMatrix;
-use rmt_spca::spca::{FistaConfig, SparsePCA, SparsePCAResult};
+use rmt_spca::spca::{EigensolverMode, FistaConfig, SparsePCA, SparsePCAResult};
 use serde::Deserialize;
 
 // ─── fixtures ────────────────────────────────────────────────────────────────
@@ -236,6 +236,135 @@ fn csr_fit_with_precomputed_factors_matches_dense() {
 
 // ─── 2. accuracy of the eigendecomposition ───────────────────────────────────
 
+/// When Sinkhorn is cut off before convergence, both paths fall back to
+/// per-gene standardisation and must agree with each other. The dense path
+/// reports the unconverged Sinkhorn factors and the CSR path the applied ones,
+/// so `bw_c`/`bw_d` are not compared; everything downstream of X_w is.
+#[test]
+fn fallback_to_standardisation_matches_between_dense_and_csr() {
+    let x = filtered(&counts(300, 80, 11));
+    let cfg = || FistaConfig {
+        bw_max_iter: 1,
+        ..cfg()
+    };
+    let dense = SparsePCA::new(cfg()).fit(&x);
+    let csr = SparsePCA::new(cfg()).fit_csr(&CsrMatrix::from_dense(&x));
+    assert!(!dense.sk_converged && !csr.sk_converged);
+    assert!(
+        dense.sk_residual > 1e-2,
+        "residual {} did not trigger the fallback",
+        dense.sk_residual
+    );
+    assert!(rel_diff(&dense.s_eigenvalues, &csr.s_eigenvalues) < 1e-10);
+    assert!((dense.sigma_sq - csr.sigma_sq).abs() < 1e-10);
+    assert_eq!(dense.eigenvalues.len(), csr.eigenvalues.len());
+    let diff = Mat::from_fn(
+        dense.components.nrows(),
+        dense.components.ncols(),
+        |i, j| dense.components.read(i, j) - csr.components.read(i, j),
+    );
+    assert!(
+        max_abs(&diff) < 1e-8,
+        "components differ by {:.2e}",
+        max_abs(&diff)
+    );
+    // the CSR path reports the factors it applied: c = 1, d = 1/sd
+    assert!(csr.bw_c.iter().all(|&c| c == 1.0));
+}
+
+/// `Full` mode takes k, the component eigenvalues and FISTA's start from the
+/// exact EVD (as the reference's `eigh` does), so `eigenvalues` must be the
+/// top of `s_eigenvalues` to round-off and `n_above_threshold` the exact
+/// count above λ+; `k_max` only caps the fit and leaves the count visible.
+#[test]
+fn full_mode_k_and_eigenvalues_come_from_the_exact_spectrum() {
+    let x = filtered(&counts(300, 80, 11));
+    let r = SparsePCA::new(FistaConfig { k_max: 50, ..cfg() }).fit(&x);
+    let mut desc = r.s_eigenvalues.clone();
+    desc.sort_by(|a, b| b.partial_cmp(a).unwrap());
+    let above = desc.iter().filter(|&&e| e > r.lambda_plus).count();
+    assert!(
+        above >= 2,
+        "fixture has {above} eigenvalues above λ+; too weak"
+    );
+    assert_eq!(r.n_above_threshold, above);
+    assert_eq!(r.eigenvalues.len(), above);
+    for (j, &e) in r.eigenvalues.iter().enumerate() {
+        assert!(
+            (e - desc[j]).abs() < 1e-12,
+            "eigenvalue {j}: {e} vs exact {}",
+            desc[j]
+        );
+    }
+    // FISTA's start spans the exact eigenvectors: with λ = 0 FISTA is a fixed
+    // point there, so the fitted components keep that span.
+    let v = Mat::from_fn(x.ncols(), above, |i, j| r.top_eigenvectors[j][i]);
+    let r0 = SparsePCA::new(FistaConfig {
+        lambda: 0.0,
+        lambda_frac: None,
+        k_max: 50,
+        ..cfg()
+    })
+    .fit(&x);
+    assert!(rmt_spca::spca::subspace_distance(&r0.components, &v) < 1e-8);
+    // the cap is honest: fewer components fitted, same count reported
+    let capped = SparsePCA::new(FistaConfig { k_max: 1, ..cfg() }).fit(&x);
+    assert_eq!(capped.eigenvalues.len(), 1);
+    assert_eq!(capped.n_above_threshold, above);
+}
+
+/// The subspace-iteration path (no full EVD) returns Ritz values in
+/// descending order after Rayleigh–Ritz, and its leading values agree with
+/// the exact spectrum; only the tail near λ+ is approximate.
+#[test]
+fn subspace_path_ritz_values_are_ordered_and_lead_exactly() {
+    let x = filtered(&counts(300, 80, 11));
+    let full = SparsePCA::new(FistaConfig { k_max: 50, ..cfg() }).fit(&x);
+    let sub = SparsePCA::new(FistaConfig {
+        eigensolver: EigensolverMode::Subsample { n_cells: 300 },
+        k_max: 50,
+        ..cfg()
+    })
+    .fit(&x);
+    assert!(
+        sub.eigenvalues.windows(2).all(|w| w[0] >= w[1]),
+        "Ritz values unordered"
+    );
+    assert!(sub.n_above_threshold <= 50);
+    for j in 0..2 {
+        let rel = (sub.eigenvalues[j] - full.eigenvalues[j]).abs() / full.eigenvalues[j];
+        assert!(rel < 1e-8, "leading Ritz value {j} off by {rel:.1e}");
+    }
+}
+
+/// `EigensolverMode::Fast`: σ² = Tr(S)/p is exactly the mean of the spectrum
+/// `Full` computes, so the two are tied by an identity; the spectrum-dependent
+/// diagnostics are absent. On this fixture (two strong programs in 80 genes)
+/// the mean sits 17% above the bulk median: the bias the mode's docs warn of.
+#[test]
+fn fast_mode_sigma_is_spectrum_mean_and_skips_spectrum() {
+    let x = filtered(&counts(300, 80, 11));
+    let full = SparsePCA::new(cfg()).fit(&x);
+    let fast = SparsePCA::new(FistaConfig {
+        eigensolver: EigensolverMode::Fast,
+        ..cfg()
+    })
+    .fit(&x);
+    let mean = full.s_eigenvalues_unrescaled.iter().sum::<f64>()
+        / full.s_eigenvalues_unrescaled.len() as f64;
+    eprintln!(
+        "σ² full={:.4} fast={:.4} (spectrum mean {mean:.4})",
+        full.sigma_sq, fast.sigma_sq
+    );
+    assert!(
+        (fast.sigma_sq - mean).abs() < 1e-10,
+        "Fast σ² {} != Tr(S)/p {mean}",
+        fast.sigma_sq
+    );
+    assert!(fast.ks_distance.is_none());
+    assert!(fast.s_eigenvalues.is_empty() && fast.top_eigenvectors.is_empty());
+}
+
 #[test]
 fn eigendecomposition_is_accurate() {
     let x = filtered(&counts(600, 150, 13));
@@ -291,8 +420,6 @@ fn eigendecomposition_is_accurate() {
 
 // ─── 3. EigensolverMode::Subsample ───────────────────────────────────────────
 
-use rmt_spca::spca::EigensolverMode;
-
 fn sub_cfg(n_cells: usize) -> FistaConfig {
     FistaConfig {
         eigensolver: EigensolverMode::Subsample { n_cells },
@@ -322,11 +449,21 @@ fn assert_same_decomposition(full: &SparsePCAResult, sub: &SparsePCAResult, tol:
         rel_diff(&full.eigenvalues, &sub.eigenvalues) < tol,
         "Rayleigh quotients"
     );
-    let dw = (0..full.components.nrows())
-        .flat_map(|i| (0..full.components.ncols()).map(move |j| (i, j)))
-        .map(|(i, j)| (full.components.read(i, j) - sub.components.read(i, j)).abs())
+    // Full starts FISTA from the exact eigenvectors, Subsample from subspace
+    // iteration: the same vectors up to a sign per column, which FISTA keeps.
+    let (p, k) = (full.components.nrows(), full.components.ncols());
+    let dw = (0..k)
+        .map(|j| {
+            let dot: f64 = (0..p)
+                .map(|i| full.components.read(i, j) * sub.components.read(i, j))
+                .sum();
+            let sgn = if dot < 0.0 { -1.0 } else { 1.0 };
+            (0..p)
+                .map(|i| (full.components.read(i, j) - sgn * sub.components.read(i, j)).abs())
+                .fold(0.0, f64::max)
+        })
         .fold(0.0, f64::max);
-    assert!(dw < 1e-8, "components max diff {dw:.2e}");
+    assert!(dw < 1e-8, "components max diff (sign-aligned) {dw:.2e}");
 }
 
 #[test]

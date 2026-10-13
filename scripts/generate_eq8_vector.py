@@ -26,6 +26,7 @@ def _gs_orthogonalize(W):
 
 
 def _fista_spca(S, V, n_comps, max_iter=10000, penalty=0.01, tol=1e-3):
+    """Returns (W, iterations run)."""
     tk, p, q, r = 1, 1 / 20, 1, 4
     lmax = np.linalg.eigvalsh(S).max()
     W = V[:, :n_comps].copy()
@@ -42,7 +43,7 @@ def _fista_spca(S, V, n_comps, max_iter=10000, penalty=0.01, tol=1e-3):
         tk = tk_temp
         if lim < tol:
             break
-    return W
+    return W, _ + 1
 
 
 d = json.load(open(os.path.join(VEC, "spiked_model.json")))
@@ -52,7 +53,7 @@ s, V = np.linalg.eigh(S); V = V[:, ::-1][:, :k]
 
 
 def distance(penalty):
-    W = _fista_spca(S, V, k, penalty=penalty)
+    W, _ = _fista_spca(S, V, k, penalty=penalty)
     sv = np.linalg.svd(W.T @ V, compute_uv=False)
     return float((1 - sv**2).sum())
 
@@ -62,5 +63,17 @@ target = 0.5 * d_hi if d_hi < 0.4 else 0.2         # make sure a root exists in 
 res = scipy.optimize.root_scalar(lambda g: distance(g) - target, bracket=(1e-4, 4), xtol=5e-3)
 out = dict(n=n, p=p, k=k, target=target, gamma_star=res.root, distance_at_star=distance(res.root),
            distance_at_06=distance(0.6 * res.root), distance_at_4=d_hi)
+
+# Direct FISTA cross-validation: W at fixed penalties from the exact top-k
+# eigenvectors, iterated to a tight tolerance so both implementations reach the
+# same fixed point. Rust runs `fista_sparse_pca` from this same V and γ.
+out["V"] = V.tolist()
+out["lmax"] = float(s.max())
+out["fista"] = []
+for pen in [0.05, 0.3, 0.6 * res.root, 2.0]:
+    W, iters = _fista_spca(S, V, k, max_iter=50000, penalty=pen, tol=1e-10)
+    out["fista"].append(dict(penalty=pen, tol=1e-10, iters=iters, W=W.tolist(),
+                             nnz=int((np.abs(W) > 1e-12).sum())))
+    print("fista penalty", pen, "iters", iters, "nnz", out["fista"][-1]["nnz"])
 json.dump(out, open(os.path.join(VEC, "eq8_penalty.json"), "w"), indent=2)
 print(out)

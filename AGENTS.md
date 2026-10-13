@@ -12,6 +12,12 @@ cargo build --release
 cargo test
 ```
 
+## Coverage
+
+```bash
+cargo llvm-cov --summary-only
+```
+
 ## Lint Commands
 
 ```bash

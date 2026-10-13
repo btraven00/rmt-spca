@@ -63,3 +63,19 @@ pub fn print_marker_table(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn top_markers_sorted_by_abs_weight_zero_filtered_truncated() {
+        let w = [0.1, -0.5, 0.0, 0.3, 1e-9];
+        let loadings = Mat::from_fn(5, 1, |i, _| w[i]);
+        let names: Vec<String> = ["a", "b", "c", "d", "e"].map(String::from).to_vec();
+        let m = get_top_markers(&loadings, &names, 0, 2);
+        let got: Vec<(&str, f64)> = m.iter().map(|g| (g.name.as_str(), g.weight)).collect();
+        assert_eq!(got, vec![("b", -0.5), ("d", 0.3)]);
+        assert_eq!(get_top_markers(&loadings, &names, 0, 10).len(), 3);
+    }
+}

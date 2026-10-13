@@ -54,7 +54,7 @@ Key `FistaConfig` fields:
 | `lambda_frac` | `None` | λ = frac × λ+; overrides `lambda`; ~0.3 targets 200–500 genes/component |
 | `lambda` | `0.1` | L1 penalty (absolute); ignored when `lambda_frac` is set |
 | `eigensolver` | `Full` | `EigensolverMode::Full` (exact), `::Fast` (approximate, 4× faster), or `::Subsample { n_cells }` (σ²/KS from an m×m Gram of m cells) |
-| `k_max` | `20` | Ceiling on signal components; raise when k saturates it |
+| `k_max` | `20` | Cap on components fitted. `Full` mode still reports the exact count above λ+ in `n_above_threshold`; in `Fast`/`Subsample` it bounds the count itself |
 | `fista_reuse_products` | `false` | One S-product per FISTA iteration instead of two (equal in exact arithmetic) |
 | `compute_ks` | `true` | Compute KS goodness-of-fit; only available with `Full` eigensolver |
 | `bw_max_iter` | `1000` | Max Sinkhorn-Knopp iterations |

@@ -123,14 +123,20 @@ pub struct FistaConfig {
     /// return in `SparsePCAResult::top_eigenvectors` (default 20). Has no
     /// effect in `EigensolverMode::Fast` (no full EVD).
     pub top_eigvec_count: usize,
-    /// Ceiling on how many signal components Stage 5's subspace iteration will
-    /// look for. k is then `count(rayleigh quotient > λ+)`, so this caps k.
+    /// Ceiling on how many signal components are fitted (default 20).
     ///
-    /// Was a hard-coded 20, which **bound on every real dataset tested**, and
-    /// silently: be1 (1715×2000) has 72 eigenvalues above λ+ but reported k=20,
-    /// and a capped result is indistinguishable from a genuine k=20. Raise it
-    /// when the component count is what you care about — cost is
-    /// O(p² · k_max · iters) here, then O(p² · k · iters) in FISTA.
+    /// In `EigensolverMode::Full` the number of eigenvalues above λ+ is known
+    /// exactly from Stage 4 and is always reported in
+    /// `SparsePCAResult::n_above_threshold`; `k_max` only caps how many of them
+    /// FISTA fits (cost O(p² · k · iters)), and `verbose` says when it did.
+    /// The reference (`BiwhitenedCovarianceEstimator.fit` in
+    /// `spcarmt/scrna/rmt/_covariance.py`) has no cap.
+    ///
+    /// In `Fast` and `Subsample` there is no full EVD: Stage 5 runs subspace
+    /// iteration on `k_max` vectors, so k = `count(ritz value > λ+)` is bounded
+    /// by `k_max` and a result with k = `k_max` is a ceiling, not a count.
+    /// Was a hard-coded 20, which bound on every real dataset tested (be1,
+    /// 1715×2000, has 72 eigenvalues above λ+).
     pub k_max: usize,
     /// One S-product per FISTA iteration instead of two (default false).
     ///
@@ -222,12 +228,13 @@ impl SparsePCA {
     /// Used for the Kolmogorov-Smirnov goodness-of-fit test against the
     /// Marchenko-Pastur distribution (Section 3.1).
     ///
-    /// **Stage 5 — RMT thresholding + subspace initialisation**
-    /// Compute the MP bulk edge λ+ = (1 + √q)² (Eq. 3).  Run subspace
-    /// iteration on S to find the top-k_max eigenvectors and their Rayleigh
-    /// quotients.  Count components with Rayleigh quotient > λ+ as signal
-    /// (BBP phase transition, Section 2.2).  The top-k eigenvectors
-    /// initialise FISTA, warm-starting it close to the solution.
+    /// **Stage 5 — RMT thresholding + FISTA start**
+    /// Compute the MP bulk edge λ+ = (1 + √q)² (Eq. 3).  Count eigenvalues
+    /// above λ+ as signal (BBP phase transition, Section 2.2); their
+    /// eigenvectors initialise FISTA, as in the reference's
+    /// `BiwhitenedCovarianceEstimator.fit` / `_fista_spca`.  In `Full` mode
+    /// these come from Stage 4's exact EVD; `Fast` and `Subsample` use
+    /// subspace iteration on `k_max` vectors instead (approximate near λ+).
     ///
     /// **Stage 6 — FISTA Sparse PCA (Algorithm 2)**
     /// Maximise Tr(W^T S W) − λ‖W‖₁ subject to W^T W = I_k via proximal
@@ -550,6 +557,9 @@ impl SparsePCA {
         // (largest) are the LAST K columns of u(), in reverse order.
         let top_eigvec_count = self.config.top_eigvec_count.min(p);
         let mut top_eigenvectors: Vec<Vec<f64>> = Vec::new();
+        // Full mode keeps the eigenvectors (columns ascending with `evd.s()`):
+        // Stage 5 takes k and FISTA's start from them, as the reference does.
+        let mut eigvecs: Option<Mat<f64>> = None;
 
         let (sigma_sq, s_eigenvalues): (f64, Vec<f64>) = match self.config.eigensolver {
             EigensolverMode::Full => {
@@ -559,15 +569,14 @@ impl SparsePCA {
                 let t = Instant::now();
                 let evd = SelfAdjointEigendecomposition::new(s.as_ref(), Side::Lower);
                 let raw_eigs: Vec<f64> = (0..p).map(|i| evd.s().column_vector().read(i)).collect();
-                if top_eigvec_count > 0 {
-                    let u = evd.u();
-                    // last K columns, reversed to be sorted descending
-                    for k in 0..top_eigvec_count {
-                        let col_idx = p - 1 - k;
-                        let col: Vec<f64> = (0..p).map(|i| u.read(i, col_idx)).collect();
-                        top_eigenvectors.push(col);
-                    }
+                let u = evd.u();
+                // last K columns, reversed to be sorted descending
+                for k in 0..top_eigvec_count {
+                    let col_idx = p - 1 - k;
+                    let col: Vec<f64> = (0..p).map(|i| u.read(i, col_idx)).collect();
+                    top_eigenvectors.push(col);
                 }
+                eigvecs = Some(u.to_owned());
                 if v {
                     eprint!("done ({:.2}s)  ", t.elapsed().as_secs_f64());
                 }
@@ -653,45 +662,78 @@ impl SparsePCA {
         let s = Mat::from_fn(p, p, |i, j| s.read(i, j) / sigma_sq);
         let s_eigenvalues: Vec<f64> = s_eigenvalues.iter().map(|&e| e / sigma_sq).collect();
 
-        // --- Stage 5: RMT thresholding + subspace initialisation ---
+        // --- Stage 5: RMT thresholding + FISTA start ---
         // λ+ = (1 + √q)² is the MP bulk edge (Eq. 3).  Eigenvalues above λ+
         // are signal outliers via the BBP phase transition (Section 2.2).
         //
-        // Subspace iteration on S converges to the top-k_max eigenvectors.
-        // Rayleigh quotients rq_j = v_j^T S v_j approximate the eigenvalues
-        // without a full O(p³) decomposition.
+        // Reference: `BiwhitenedCovarianceEstimator.fit` (spcarmt
+        // `scrna/rmt/_covariance.py`) takes `np.linalg.eigh(S)` and counts
+        // `eigs > lplus + 0.01` as `n_comps_`; `_adjust_penalty` and
+        // `_fista_spca` (`scrna/prc/_spca.py`) start FISTA from the top
+        // `n_comps` columns of the same `eigh`, descending, with
+        // `lmax = max(s)`. In `Full` mode that spectrum is Stage 4's, so k, the
+        // eigenvalues and the start come from it exactly (threshold λ+ itself:
+        // the reference's +0.01 is an absolute margin with no scaling argument).
+        //
+        // Without a full EVD (`Fast`, `Subsample`), subspace iteration on k_max
+        // vectors stands in: its Ritz values approximate the top eigenvalues,
+        // but near λ+ the spectrum is dense and convergence is slow, so the
+        // tail count is approximate and bounded by k_max.
         let k_max = self.config.k_max.min(p).min(n);
-        if v {
-            eprint!("[RMT/subspace] subspace iteration (k_max={k_max}) ... ");
-        }
         let t = Instant::now();
         let rmt = rmt_pre; // reuse — same q = p/n
         let lambda_plus = rmt.lambda_plus();
-        let v_cand = subspace_iteration(&s, k_max, 100);
-        // Rayleigh quotients  rq_j = v_j^T S v_j
-        let sv_cand = mat_mul(&s, &v_cand);
-        let rq: Vec<f64> = (0..k_max)
-            .map(|j| (0..p).map(|i| v_cand.read(i, j) * sv_cand.read(i, j)).sum())
-            .collect();
-        let lmax = rq.iter().cloned().fold(0.0_f64, f64::max);
-        // k = number of eigenvalues above the BBP threshold; at least 1.
-        let k = rq.iter().filter(|&&r| r > lambda_plus).count().max(1);
+        // rq: top candidate eigenvalues, descending; v_cand their vectors;
+        // n_above: eigenvalues above λ+ (exact in Full, else among the k_max).
+        let (rq, v_cand, n_above): (Vec<f64>, Mat<f64>, usize) = match &eigvecs {
+            Some(u) => {
+                // s_eigenvalues is ascending (faer); the top m are the last m.
+                let n_above = s_eigenvalues.iter().filter(|&&e| e > lambda_plus).count();
+                let m = n_above.clamp(1, k_max);
+                let rq: Vec<f64> = (0..m).map(|j| s_eigenvalues[p - 1 - j]).collect();
+                let v_cand = Mat::from_fn(p, m, |i, j| u.read(i, p - 1 - j));
+                (rq, v_cand, n_above)
+            }
+            None => {
+                if v {
+                    eprint!("[RMT/subspace] subspace iteration (k_max={k_max}) ... ");
+                }
+                let v_cand = subspace_iteration(&s, k_max, 100);
+                // Ritz values θ_j = v_j^T S v_j, descending after Rayleigh–Ritz
+                let sv_cand = mat_mul(&s, &v_cand);
+                let rq: Vec<f64> = (0..k_max)
+                    .map(|j| (0..p).map(|i| v_cand.read(i, j) * sv_cand.read(i, j)).sum())
+                    .collect();
+                let n_above = rq.iter().filter(|&&r| r > lambda_plus).count();
+                (rq, v_cand, n_above)
+            }
+        };
+        let lmax = rq[0];
+        // k = number of eigenvalues above the BBP threshold, capped by k_max; at least 1.
+        let k = n_above.clamp(1, k_max);
         let v_init = Mat::from_fn(p, k, |i, j| v_cand.read(i, j));
+        // In Full mode the count is exact, so k < n_above is a cap; in the
+        // subspace modes a k that fills k_max is a ceiling, not a count.
+        let capped = if eigvecs.is_some() {
+            n_above > k
+        } else {
+            k == k_max
+        };
         if v {
             eprintln!(
-                "λ_max = {lmax:.4}  λ+ = {lambda_plus:.4}  components = {k}{}  ({:.2}s)",
-                if k == k_max { " [CAPPED by k_max]" } else { "" },
+                "λ_max = {lmax:.4}  λ+ = {lambda_plus:.4}  above λ+ = {n_above}  components = {k}{}  ({:.2}s)",
+                if capped { " [CAPPED by k_max]" } else { "" },
                 t.elapsed().as_secs_f64()
             );
-            // k saturating k_max means the count is a ceiling, not a result --
-            // the subspace iteration never looked past k_max, so the true number
-            // of eigenvalues above λ+ may be far higher. Say so: this is the
-            // method's headline output and it must not be silently truncated.
-            if k == k_max {
+            if capped {
                 eprintln!(
-                    "[RMT/subspace] WARNING: k saturated k_max={k_max}; the true signal \
-                     count is >= {k_max} and is NOT determined by this run. Raise \
-                     FistaConfig::k_max."
+                    "[RMT/subspace] WARNING: k_max={k_max} caps the components fitted; {} \
+                     Raise FistaConfig::k_max.",
+                    if eigvecs.is_some() {
+                        format!("{n_above} eigenvalues are above λ+.")
+                    } else {
+                        format!("the true count is >= {k_max} and NOT determined by this run.")
+                    }
                 );
             }
         }
@@ -784,8 +826,8 @@ impl SparsePCA {
             }
         }
 
-        // Rayleigh quotients for the k signal components (used in validate.rs
-        // for the predicted-overlap table via BBP formula, Eq. 9).
+        // Eigenvalues (Full) / Ritz values (other modes) of the k signal
+        // components: the predicted-overlap table uses them via BBP (Eq. 9).
         let eigenvalues: Vec<f64> = rq[..k].to_vec();
 
         // KS diagnostic: only available in Full mode when compute_ks = true.
@@ -818,6 +860,7 @@ impl SparsePCA {
         SparsePCAResult {
             components,
             eigenvalues,
+            n_above_threshold: n_above,
             s_eigenvalues,
             lambda,
             lambda_star,
@@ -845,9 +888,16 @@ pub struct SparsePCAResult {
     /// Sparse loading matrix W (p × k).  Each column is one component;
     /// most entries are zero due to the L1 penalty.
     pub components: Mat<f64>,
-    /// Rayleigh quotients v_j^T S v_j for the k signal components (descending).
-    /// Used to compute predicted overlaps via the BBP formula (Eq. 9).
+    /// Eigenvalues of the σ̂²-rescaled S for the k signal components,
+    /// descending: exact in `EigensolverMode::Full`, Ritz values from subspace
+    /// iteration otherwise. Used to compute predicted overlaps via the BBP
+    /// formula (Eq. 9).
     pub eigenvalues: Vec<f64>,
+    /// Eigenvalues above λ+. Exact in `Full` mode (the reference's `n_comps_`,
+    /// up to its +0.01 margin), so `eigenvalues.len() < n_above_threshold`
+    /// means `FistaConfig::k_max` capped the fit. In `Fast` / `Subsample` it is
+    /// the count among the `k_max` Ritz values, hence at most `k_max`.
+    pub n_above_threshold: usize,
     /// All p eigenvalues of the biwhitened covariance S (ascending order).
     /// Empty when `EigensolverMode::Fast` is used.
     /// Used for the Kolmogorov-Smirnov test against the MP distribution.
@@ -1229,7 +1279,16 @@ fn subspace_iteration(s: &Mat<f64>, k: usize, n_iter: usize) -> Mat<f64> {
         let sv = mat_mul(s, &v);
         v = orthonormalize(&sv);
     }
-    v
+    // Rayleigh–Ritz: rotate within span(V) to the eigenvectors of VᵀSV, so the
+    // columns are the best approximations the subspace holds and their Ritz
+    // values come out in descending order (plain iteration leaves the slowly
+    // converging tail mixed and unordered).
+    let h: Mat<f64> = v.as_ref().transpose() * mat_mul(s, &v).as_ref();
+    let evd = SelfAdjointEigendecomposition::new(h.as_ref(), Side::Lower);
+    let q = evd.u();
+    // faer's eigenvalues are ascending: reverse the columns of Q
+    let q_desc = Mat::from_fn(k, k, |i, j| q.read(i, k - 1 - j));
+    mat_mul(&v, &q_desc)
 }
 
 /// Frobenius distance ‖A − B‖_F, used for the iterate-change stopping test.
@@ -1494,6 +1553,86 @@ mod tests {
             v8.target,
             v8.distance_at_star
         );
+    }
+
+    /// Direct cross-validation of the FISTA iteration against the Python
+    /// reference (`_fista_spca`, ported in `scripts/generate_eq8_vector.py`):
+    /// same S, same exact top-k eigenvectors V, same γ = 0.5/(2λ_max), same
+    /// stopping rule (‖ΔW‖_F < 1e-10, objective test off), so both reach the
+    /// same fixed point and W agrees to round-off (observed 4e-16), support included.
+    #[test]
+    fn fista_matches_python_reference_at_fixed_penalties() {
+        #[derive(serde::Deserialize)]
+        struct Case {
+            penalty: f64,
+            tol: f64,
+            #[serde(rename = "W")]
+            w: Vec<Vec<f64>>,
+            nnz: usize,
+        }
+        #[derive(serde::Deserialize)]
+        struct Vec8 {
+            k: usize,
+            #[serde(rename = "V")]
+            v: Vec<Vec<f64>>,
+            lmax: f64,
+            fista: Vec<Case>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Spiked {
+            #[serde(rename = "X")]
+            x: Vec<Vec<f64>>,
+        }
+        let v8: Vec8 = serde_json::from_str(
+            &std::fs::read_to_string("test_vectors/eq8_penalty.json").unwrap(),
+        )
+        .unwrap();
+        let sp: Spiked = serde_json::from_str(
+            &std::fs::read_to_string("test_vectors/spiked_model.json").unwrap(),
+        )
+        .unwrap();
+        let (n, p, k) = (sp.x.len(), sp.x[0].len(), v8.k);
+        let s = sample_covariance(&Mat::from_fn(n, p, |i, j| sp.x[i][j]));
+        let v = Mat::from_fn(p, k, |i, j| v8.v[i][j]);
+        let gamma = 0.5 / (2.0 * v8.lmax);
+        assert!(!v8.fista.is_empty());
+        for case in &v8.fista {
+            for reuse in [false, true] {
+                let w = fista_sparse_pca(
+                    &s,
+                    &v,
+                    gamma,
+                    case.penalty,
+                    50_000,
+                    case.tol,
+                    0.0,
+                    false,
+                    reuse,
+                );
+                let mut max_err = 0.0_f64;
+                let mut nnz = 0usize;
+                for j in 0..k {
+                    // FISTA from the same V is deterministic, but align signs anyway
+                    let dot: f64 = (0..p).map(|i| w.read(i, j) * case.w[i][j]).sum();
+                    let sgn = if dot < 0.0 { -1.0 } else { 1.0 };
+                    for i in 0..p {
+                        let got = sgn * w.read(i, j);
+                        max_err = max_err.max((got - case.w[i][j]).abs());
+                        nnz += (got.abs() > 1e-12) as usize;
+                    }
+                }
+                assert!(
+                    max_err < 1e-12,
+                    "penalty {}: max |W_rust − W_python| = {max_err:.2e} (reuse={reuse})",
+                    case.penalty
+                );
+                assert_eq!(nnz, case.nnz, "penalty {}: support differs", case.penalty);
+                eprintln!(
+                    "penalty {:.4}: max err {max_err:.1e}, nnz {nnz} (reuse={reuse})",
+                    case.penalty
+                );
+            }
+        }
     }
 
     #[test]

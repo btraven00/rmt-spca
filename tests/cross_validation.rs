@@ -191,6 +191,9 @@ struct BiwhiteningData {
     p: usize,
     #[serde(rename = "X")]
     x: Vec<Vec<f64>>,
+    #[serde(rename = "Xw")]
+    xw: Vec<Vec<f64>>,
+    alpha: f64,
     #[allow(dead_code)]
     col_variances: Vec<f64>,
     #[allow(dead_code)]
@@ -236,6 +239,55 @@ fn biwhitening_produces_unit_variance() {
             "row {i} variance = {var:.4} (expected ~1.0)"
         );
     }
+}
+
+/// The biwhitened matrix itself. Python starts Sinkhorn from (r, c) = (p, n)
+/// and Rust from (1, 1), and the stopping rule is the same (change of
+/// |Var(X_w) − 1|), so both land on the same X_w: the fixed point is unique up
+/// to the (c·t, d/t) gauge, which leaves X_w unchanged. Agreement is ~5e-7
+/// relative at tol = 1e-8 (the reference's run); 1e-5 leaves room for the
+/// different iterate they stop at.
+#[test]
+fn biwhitening_matrix_matches_python() {
+    let data: BiwhiteningData = load("biwhitening.json");
+    let (n, p) = (data.n, data.p);
+    let x = faer::Mat::from_fn(n, p, |i, j| data.x[i][j]);
+    let bw = rmt_spca::biwhitening::Biwhitener {
+        max_iter: 5000,
+        tol: 1e-8,
+        damp: 1.0,
+    };
+    let (c, d, _, converged, _) = bw.compute(&x);
+    assert!(converged);
+    let xw = rmt_spca::biwhitening::Biwhitener::apply(&x, &c, &d);
+    let mut max_rel = 0.0_f64;
+    for i in 0..n {
+        for j in 0..p {
+            let (got, want) = (xw.read(i, j), data.xw[i][j]);
+            max_rel = max_rel.max((got - want).abs() / want.abs());
+        }
+    }
+    eprintln!("biwhitening X_w max relative error vs Python: {max_rel:.2e}");
+    assert!(max_rel < 1e-5, "X_w differs from Python: {max_rel:.2e}");
+}
+
+/// σ² against the reference's `alpha` (`_get_scaling_marchenko_pastur`, the
+/// factor `biwhitening()` folds into D1). Conventions differ on purpose:
+/// Python takes the median of ALL eigenvalues of the UNCENTRED X_wᵀX_w/n; Rust
+/// takes the bulk median (0.001 < λ ≤ λ+) of the centred X_wcᵀX_wc/(n−1).
+/// On this noise-only vector they agree to 0.1 %; a 1 % tolerance would still
+/// catch a wrong convention (n vs n−1 alone is 1.7 % here).
+#[test]
+fn sigma_sq_matches_python_alpha() {
+    let data: BiwhiteningData = load("biwhitening.json");
+    let x = faer::Mat::from_fn(data.n, data.p, |i, j| data.x[i][j]);
+    let result = rmt_spca::spca::SparsePCA::new(rmt_spca::spca::FistaConfig::default()).fit(&x);
+    let rel = (result.sigma_sq - data.alpha).abs() / data.alpha;
+    eprintln!(
+        "σ²: rust={:.6}, python alpha={:.6}, rel_err={rel:.2e}",
+        result.sigma_sq, data.alpha
+    );
+    assert!(rel < 0.01, "σ² diverged from reference alpha: {rel:.2e}");
 }
 
 #[test]

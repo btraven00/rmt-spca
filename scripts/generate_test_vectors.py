@@ -20,7 +20,7 @@ from the spcarmt package by Victor Chardès, used here under the MIT License:
 Source files copied from:
   - ../spcarmt/scrna/rmt/_covariance.py
       marchenko_pastur_density, marchenko_pastur_cumulative,
-      marchenko_pastur_median, biwhitening
+      marchenko_pastur_median, biwhitening, _get_scaling_marchenko_pastur
   - ../spcarmt/scrna/rmt/_toy.py
       predicted_overlap, predicted_eigval, invert_predicted_eigval
 
@@ -99,7 +99,18 @@ def invert_predicted_eigval(sample_spike, gamma, s2=1):
 # Copyright (c) 2025 Victor Chardès, MIT License
 # Note: alpha rescaling (D1/sqrt(alpha)) is omitted intentionally — we want
 # the raw biwhitened matrix for fixed-point testing, not the MP-scaled version.
+# alpha itself is stored separately (`alpha` field) to cross-validate σ².
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def _get_scaling_marchenko_pastur(X):
+    n, p = X.shape
+    Y = X/np.sqrt(n)
+    if p > n:
+        Y = X.T/np.sqrt(p)
+    eigs, _ = np.linalg.eigh((Y.T@Y))
+    lmed = np.median(eigs)
+    alpha = lmed/marchenko_pastur_median(p/n)
+    return alpha
 
 def biwhitening(X, max_iter=1000, vperiod=5, tol=1e-5):
     P = X**2
@@ -242,6 +253,11 @@ print(f"  row 2nd moments (= 1 + mean²): mean={row_second_moments.mean():.4f}")
 Xwc = Xw - Xw.mean(axis=0)
 S = Xwc.T @ Xwc / (n - 1)
 eigs = np.sort(np.linalg.eigvalsh(S))[::-1]
+# Reference σ² (the `alpha` that biwhitening() folds into D1): median of ALL
+# eigenvalues of the UNCENTRED X_wᵀX_w/n over the MP median. Rust uses the
+# bulk median of the centred S = X_wcᵀX_wc/(n−1) instead; see docs/testing.md.
+alpha = float(_get_scaling_marchenko_pastur(Xw))
+print(f"  alpha (reference σ²): {alpha:.6f}")
 
 bw_data = {
     "n": n,
@@ -252,6 +268,7 @@ bw_data = {
     "col_variances": col_var.tolist(),
     "row_variances": row_var.tolist(),
     "eigenvalues": eigs.tolist(),
+    "alpha": alpha,
 }
 save("biwhitening.json", bw_data)
 
