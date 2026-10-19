@@ -1058,23 +1058,17 @@ pub(crate) fn fista_sparse_pca(
         } else {
             s.apply(&y)
         };
-        let mut z = Mat::from_fn(p, k, |i, j| y.read(i, j) + 2.0 * gamma * sy.read(i, j));
-
         // Step 2: soft-threshold (proximal operator of λ‖·‖₁)
         // threshold = γλ; entries with |z_ij| ≤ γλ are zeroed out.
-        for i in 0..p {
-            for j in 0..k {
-                let v = z.read(i, j);
-                let shrunk = v.abs() - lambda * gamma;
-                z.as_mut().write(
-                    i,
-                    j,
-                    if shrunk > 0.0 {
-                        shrunk * v.signum()
-                    } else {
-                        0.0
-                    },
-                );
+        // Both steps fused in one pass over column slices.
+        let (g2, thr) = (2.0 * gamma, lambda * gamma);
+        let mut z = Mat::<f64>::zeros(p, k);
+        for j in 0..k {
+            let (yj, sj) = (y.col_as_slice(j), sy.col_as_slice(j));
+            for ((zi, &yi), &si) in z.col_as_slice_mut(j).iter_mut().zip(yj).zip(sj) {
+                let v = yi + g2 * si;
+                let shrunk = v.abs() - thr;
+                *zi = if shrunk > 0.0 { shrunk * v.signum() } else { 0.0 };
             }
         }
 
@@ -1084,7 +1078,7 @@ pub(crate) fn fista_sparse_pca(
         // Stopping criteria
         let sz = s.apply(&z);
         let obj_new = trace_with(&z, &sz);
-        let dw = frobenius_diff(&z, &prev_w, p, k);
+        let dw = frobenius_diff(&z, &prev_w);
         let dvar = (obj_new - obj_prev).abs();
         let iterate_ok = dw < tol;
         let obj_ok = dvar / (obj_prev.abs() + 1e-10) < tol_obj;
@@ -1120,14 +1114,10 @@ pub(crate) fn fista_sparse_pca(
         // and preserve the O(1/k²) convergence guarantee.
         let next_t = (1.0 / 20.0 + (1.0 + 4.0 * t * t).sqrt()) / 2.0;
         let beta = (t - 1.0) / next_t;
-        y = Mat::from_fn(p, k, |i, j| {
-            z.read(i, j) + beta * (z.read(i, j) - prev_w.read(i, j))
-        });
+        y = extrapolate(&z, &prev_w, beta);
         // S·Y by linearity from S·Z and S·W_prev (only used with reuse_products)
         sy_next = if reuse_products {
-            Mat::from_fn(p, k, |i, j| {
-                sz.read(i, j) + beta * (sz.read(i, j) - s_prev_w.read(i, j))
-            })
+            extrapolate(&sz, &s_prev_w, beta)
         } else {
             Mat::new()
         };
@@ -1143,12 +1133,8 @@ pub(crate) fn fista_sparse_pca(
 /// orthonormal columns), σ_j the singular values of WᵀV. Since Σ σ_j² = ‖WᵀV‖_F²
 /// this needs no SVD. 0 when W spans V; each column of W orthogonal to V adds 1.
 pub fn subspace_distance(w: &Mat<f64>, v: &Mat<f64>) -> f64 {
-    let z = w.as_ref().transpose() * v.as_ref();
-    let fro2: f64 = (0..z.nrows())
-        .flat_map(|i| (0..z.ncols()).map(move |j| (i, j)))
-        .map(|(i, j)| z.read(i, j).powi(2))
-        .sum();
-    w.ncols() as f64 - fro2
+    let z: Mat<f64> = w.as_ref().transpose() * v.as_ref();
+    w.ncols() as f64 - z.squared_norm_l2()
 }
 
 /// Eq. 8 penalty selection (paper's `_adjust_penalty`): the λ* at which
@@ -1299,8 +1285,7 @@ impl Cov for CovOp {
             CovOp::Dense(s) => s.apply(z),
             CovOp::Factor { x, inv } => {
                 let xz: Mat<f64> = x.as_ref() * z.as_ref();
-                let r: Mat<f64> = x.as_ref().transpose() * xz.as_ref();
-                Mat::from_fn(r.nrows(), r.ncols(), |i, j| r.read(i, j) * inv)
+                faer::scale(*inv) * (x.as_ref().transpose() * xz.as_ref())
             }
         }
     }
@@ -1366,14 +1351,39 @@ impl CovOp {
 }
 
 fn trace_with(w: &Mat<f64>, sw: &Mat<f64>) -> f64 {
-    let (p, k) = (w.nrows(), w.ncols());
-    let mut acc = 0.0_f64;
-    for i in 0..p {
-        for j in 0..k {
-            acc += w.read(i, j) * sw.read(i, j);
+    (0..w.ncols())
+        .map(|j| dot(w.col_as_slice(j), sw.col_as_slice(j)))
+        .sum()
+}
+
+/// Σ a_i b_i with 8 independent accumulators so the reduction vectorises
+/// (summation order differs from a serial loop only by reassociation).
+fn dot(a: &[f64], b: &[f64]) -> f64 {
+    let mut acc = [0.0_f64; 8];
+    let (ca, cb) = (a.chunks_exact(8), b.chunks_exact(8));
+    let (ra, rb) = (ca.remainder(), cb.remainder());
+    for (xa, xb) in ca.zip(cb) {
+        for l in 0..8 {
+            acc[l] += xa[l] * xb[l];
         }
     }
-    acc
+    acc.iter().sum::<f64>() + ra.iter().zip(rb).map(|(x, y)| x * y).sum::<f64>()
+}
+
+/// A + β (A − B), elementwise over column slices.
+fn extrapolate(a: &Mat<f64>, b: &Mat<f64>, beta: f64) -> Mat<f64> {
+    let mut out = Mat::<f64>::zeros(a.nrows(), a.ncols());
+    for j in 0..a.ncols() {
+        for ((o, &x), &y) in out
+            .col_as_slice_mut(j)
+            .iter_mut()
+            .zip(a.col_as_slice(j))
+            .zip(b.col_as_slice(j))
+        {
+            *o = x + beta * (x - y);
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1416,22 +1426,22 @@ fn sample_covariance(x: &Mat<f64>) -> Mat<f64> {
 /// orthogonality constraint in Algorithm 2.
 fn orthonormalize(a: &Mat<f64>) -> Mat<f64> {
     let (p, k) = (a.nrows(), a.ncols());
-    let mut q = a.clone();
+    let mut q = Mat::<f64>::zeros(p, k);
+    let mut v = vec![0.0_f64; p];
     for j in 0..k {
+        v.copy_from_slice(a.col_as_slice(j));
         for jj in 0..j {
-            let dot: f64 = (0..p).map(|i| q.read(i, jj) * q.read(i, j)).sum();
-            for i in 0..p {
-                let v = q.read(i, j) - dot * q.read(i, jj);
-                q.as_mut().write(i, j, v);
+            let u = q.col_as_slice(jj);
+            let d = dot(u, &v);
+            for (vi, &ui) in v.iter_mut().zip(u) {
+                *vi -= d * ui;
             }
         }
-        let norm: f64 = (0..p).map(|i| q.read(i, j).powi(2)).sum::<f64>().sqrt();
+        let norm = dot(&v, &v).sqrt();
         if norm > 1e-14 {
-            for i in 0..p {
-                let v = q.read(i, j) / norm;
-                q.as_mut().write(i, j, v);
-            }
+            v.iter_mut().for_each(|x| *x /= norm);
         }
+        q.col_as_slice_mut(j).copy_from_slice(&v);
     }
     q
 }
@@ -1473,9 +1483,20 @@ fn subspace_iteration(s: &impl Cov, k: usize, n_iter: usize) -> Mat<f64> {
 }
 
 /// Frobenius distance ‖A − B‖_F, used for the iterate-change stopping test.
-fn frobenius_diff(a: &Mat<f64>, b: &Mat<f64>, p: usize, k: usize) -> f64 {
-    (0..p)
-        .flat_map(|i| (0..k).map(move |j| (a.read(i, j) - b.read(i, j)).powi(2)))
+fn frobenius_diff(a: &Mat<f64>, b: &Mat<f64>) -> f64 {
+    let k = a.ncols();
+    (0..k)
+        .map(|j| {
+            let (ca, cb) = (a.col_as_slice(j).chunks_exact(8), b.col_as_slice(j).chunks_exact(8));
+            let (ra, rb) = (ca.remainder(), cb.remainder());
+            let mut acc = [0.0_f64; 8];
+            for (xa, xb) in ca.zip(cb) {
+                for l in 0..8 {
+                    acc[l] += (xa[l] - xb[l]).powi(2);
+                }
+            }
+            acc.iter().sum::<f64>() + ra.iter().zip(rb).map(|(x, y)| (x - y).powi(2)).sum::<f64>()
+        })
         .sum::<f64>()
         .sqrt()
 }
