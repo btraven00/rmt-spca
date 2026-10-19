@@ -152,6 +152,14 @@ pub struct FistaConfig {
     /// Eq. 8 search: multiply `tolerance` and `tol_obj` by this during the root search only;
     /// the final fit at SCALE·λ* always uses the exact tolerances.
     pub eq8_search_tol_factor: f64,
+    /// σ² estimation (Stage 4): median over *all* non-zero eigenvalues, as the reference
+    /// `_get_scaling_marchenko_pastur` does, instead of the default median over the eigenvalues
+    /// at or below λ+ (outliers dropped first). Neither is unbiased once spikes are present
+    /// (`sigma_sq_bulk_median_estimators` test: 30 strong spikes in 300 × 900 noise, all-eigs
+    /// +5 … +8 %, below-edge −0.2 … −3.5 %); the two differ by about k/n, which moves k by tens
+    /// on spectra with a dense near-edge tail (ATAC promoter counts: 98 vs 80). Set this to
+    /// reproduce the reference's rank exactly (BUGS.md, 2026-10-19).
+    pub sigma_bulk_all: bool,
 }
 
 impl Default for FistaConfig {
@@ -174,6 +182,7 @@ impl Default for FistaConfig {
             fista_reuse_products: false,
             eq8_warm_start: true,
             eq8_search_tol_factor: 10.0,
+            sigma_bulk_all: false,
         }
     }
 }
@@ -601,7 +610,7 @@ impl SparsePCA {
                 let mut bulk_eigs: Vec<f64> = raw_eigs
                     .iter()
                     .cloned()
-                    .filter(|&e| e > 0.001 && e <= lplus_pre)
+                    .filter(|&e| e > 0.001 && (self.config.sigma_bulk_all || e <= lplus_pre))
                     .collect();
                 bulk_eigs.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
                 let sq = if !bulk_eigs.is_empty() {
@@ -620,7 +629,7 @@ impl SparsePCA {
                 let mut bulk: Vec<f64> = eigs
                     .iter()
                     .cloned()
-                    .filter(|&e| e > 0.001 && e <= lplus_sub)
+                    .filter(|&e| e > 0.001 && (self.config.sigma_bulk_all || e <= lplus_sub))
                     .collect();
                 bulk.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
                 let sq = if bulk.is_empty() {
@@ -1856,6 +1865,56 @@ mod tests {
             let w = fista_sparse_pca(&s, &v_init, gamma, 0.0, 500, 1e-8, 1e-8, false, reuse);
             let dot: f64 = (0..p).map(|i| w.read(i, 0) * v0[i]).sum::<f64>();
             assert!(dot.abs() > 0.99, "alignment = {dot} (reuse={reuse})");
+        }
+    }
+
+    /// Noise N(0,1) with 30 planted spikes, n = 300, p = 900, biwhitening skipped (unit factors).
+    /// Without spikes both σ² estimators agree and are ≈ 1; with spikes the all-eigenvalues median
+    /// (reference) sits above the below-edge median (default). Prints both; --nocapture to see them.
+    #[test]
+    fn sigma_sq_bulk_median_estimators() {
+        let (n, p, k) = (300usize, 900usize, 30usize);
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut unif = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let mut gauss = move || {
+            let (u1, u2) = (unif().max(1e-300), unif());
+            (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+        };
+        let noise = Mat::from_fn(n, p, |_, _| gauss());
+        let scores = Mat::from_fn(n, k, |_, _| gauss());
+        let loads = Mat::from_fn(k, p, |_, _| gauss() / (p as f64).sqrt());
+        for strength in [0.0, 1.5, 3.0, 6.0] {
+            let x = Mat::from_fn(n, p, |i, j| {
+                noise.read(i, j) + strength * (0..k).map(|c| scores.read(i, c) * loads.read(c, j)).sum::<f64>()
+            });
+            let run = |all: bool| {
+                SparsePCA::new(FistaConfig {
+                    lambda: 0.0,
+                    k_max: 2,
+                    compute_ks: false,
+                    verbose: false,
+                    precomputed_factors: Some((Col::from_fn(n, |_| 1.0), Col::from_fn(p, |_| 1.0))),
+                    sigma_bulk_all: all,
+                    ..FistaConfig::default()
+                })
+                .fit(&x)
+            };
+            let (all, below) = (run(true), run(false));
+            println!(
+                "strength {strength}: all-eigs σ² = {:.4} (k = {}), below-edge σ² = {:.4} (k = {})",
+                all.sigma_sq, all.n_above_threshold, below.sigma_sq, below.n_above_threshold
+            );
+            if strength == 0.0 {
+                assert!((all.sigma_sq - 1.0).abs() < 0.05 && (below.sigma_sq - 1.0).abs() < 0.05);
+                assert_eq!(all.sigma_sq, below.sigma_sq);
+            } else {
+                assert!(all.sigma_sq > below.sigma_sq, "all {} below {}", all.sigma_sq, below.sigma_sq);
+            }
         }
     }
 }
