@@ -146,6 +146,12 @@ pub struct FistaConfig {
     /// product is dropped. Equal in exact arithmetic; in floating point the
     /// iterates differ at round-off level.
     pub fista_reuse_products: bool,
+    /// Eq. 8 search: continue FISTA from the solution at the largest λ known to lie below the
+    /// root (a denser solution) instead of restarting from the eigenvectors every evaluation.
+    pub eq8_warm_start: bool,
+    /// Eq. 8 search: multiply `tolerance` and `tol_obj` by this during the root search only;
+    /// the final fit at SCALE·λ* always uses the exact tolerances.
+    pub eq8_search_tol_factor: f64,
 }
 
 impl Default for FistaConfig {
@@ -166,13 +172,15 @@ impl Default for FistaConfig {
             top_eigvec_count: 20,
             k_max: 20,
             fista_reuse_products: false,
+            eq8_warm_start: true,
+            eq8_search_tol_factor: 10.0,
         }
     }
 }
 
 /// Output of Stages 0–3: the biwhitened covariance and the biwhitening state.
 struct Front {
-    s: Mat<f64>,
+    cov: CovOp,
     n: usize,
     p: usize,
     c: Col<f64>,
@@ -356,16 +364,21 @@ impl SparsePCA {
             eprint!("[covariance]   Xᵀ X / (n-1)  ({p}×{p}) ... ");
         }
         let t = Instant::now();
-        let s = sample_covariance(&xwc);
-        if v {
-            eprint!("done ({:.2}s)  ", t.elapsed().as_secs_f64());
-        }
-
         let sub_spectrum = self
             .subsample_rows(n)
             .map(|rows| gram_spectrum(&Mat::from_fn(rows.len(), p, |t, j| xwc.read(rows[t], j))));
+        // 2n <= p: keep S = XᵀX/(n−1) factored (cell space). S z costs 2npk instead of p²k (a win
+        // only below n = p/2) and the eigendecomposition runs on the n×n Gram matrix; nothing changes numerically.
+        let cov = if 2 * n <= p {
+            CovOp::Factor { x: xwc, inv: 1.0 / (n - 1) as f64 }
+        } else {
+            CovOp::Dense(sample_covariance(&xwc))
+        };
+        if v {
+            eprint!("done ({:.2}s{})  ", t.elapsed().as_secs_f64(), if 2 * n <= p { ", factored, 2n<=p" } else { "" });
+        }
         self.decompose(Front {
-            s,
+            cov,
             n,
             p,
             c,
@@ -404,7 +417,7 @@ impl SparsePCA {
             _ => None,
         };
         self.decompose(Front {
-            s,
+            cov: CovOp::Dense(s),
             n,
             p,
             c,
@@ -498,9 +511,15 @@ impl SparsePCA {
             eprint!("[covariance]   sparse YᵀY − nμμᵀ  ({p}×{p}) ... ");
         }
         let t = Instant::now();
-        let s = data.biwhitened_covariance(&xt, &c, &d);
+        let cov = if 2 * n <= p {
+            let mu = data.biwhitened_mean(&xt, &c, &d);
+            let rows: Vec<usize> = (0..n).collect();
+            CovOp::Factor { x: data.centred_rows(&rows, &c, &d, &mu), inv: 1.0 / (n - 1) as f64 }
+        } else {
+            CovOp::Dense(data.biwhitened_covariance(&xt, &c, &d))
+        };
         if v {
-            eprint!("done ({:.2}s)  ", t.elapsed().as_secs_f64());
+            eprint!("done ({:.2}s{})  ", t.elapsed().as_secs_f64(), if 2 * n <= p { ", factored, 2n<=p" } else { "" });
         }
         let sub_spectrum = self.subsample_rows(n).map(|rows| {
             let mu = data.biwhitened_mean(&xt, &c, &d);
@@ -509,7 +528,7 @@ impl SparsePCA {
         drop((data, xt));
 
         self.decompose(Front {
-            s,
+            cov,
             n,
             p,
             c,
@@ -525,7 +544,7 @@ impl SparsePCA {
     fn decompose(&self, f: Front) -> SparsePCAResult {
         let v = self.config.verbose;
         let Front {
-            s,
+            cov,
             n,
             p,
             c,
@@ -564,23 +583,19 @@ impl SparsePCA {
         let (sigma_sq, s_eigenvalues): (f64, Vec<f64>) = match self.config.eigensolver {
             EigensolverMode::Full => {
                 if v {
-                    eprint!("[eigenspectrum] full EVD ({p}×{p}) ... ");
+                    eprint!("[eigenspectrum] full EVD ({}) ... ", match &cov { CovOp::Dense(_) => format!("{p}×{p}"), CovOp::Factor { .. } => format!("Gram {n}×{n}") });
                 }
                 let t = Instant::now();
-                let evd = SelfAdjointEigendecomposition::new(s.as_ref(), Side::Lower);
-                let raw_eigs: Vec<f64> = (0..p).map(|i| evd.s().column_vector().read(i)).collect();
-                let u = evd.u();
-                // last K columns, reversed to be sorted descending
-                for k in 0..top_eigvec_count {
-                    let col_idx = p - 1 - k;
-                    let col: Vec<f64> = (0..p).map(|i| u.read(i, col_idx)).collect();
-                    top_eigenvectors.push(col);
+                // eigenvalues ascending (length p), top-m eigenvectors as columns, descending
+                let m_keep = top_eigvec_count.max(self.config.k_max.min(p).min(n)).max(1);
+                let (raw_eigs, vecs) = cov.full_evd(m_keep);
+                for k in 0..top_eigvec_count.min(vecs.ncols()) {
+                    top_eigenvectors.push((0..p).map(|i| vecs.read(i, k)).collect());
                 }
-                eigvecs = Some(u.to_owned());
+                eigvecs = Some(vecs);
                 if v {
                     eprint!("done ({:.2}s)  ", t.elapsed().as_secs_f64());
                 }
-
                 let lambda_med_mp = rmt_pre.mp_median();
                 let lplus_pre = rmt_pre.lambda_plus();
                 let mut bulk_eigs: Vec<f64> = raw_eigs
@@ -635,7 +650,7 @@ impl SparsePCA {
                 //   biwhitening normalises per-gene variance (Σᵢ x²ᵢⱼ/n ≈ 1).
                 //   Tr(S) = Σⱼ Σᵢ x²ᵢⱼ/(n-1) ≈ n·p/(n-1)·σ² and dividing by
                 //   p gives σ² × n/(n-1) ≈ σ².  Using p (not rank = n-1) is correct.
-                let trace: f64 = (0..p).map(|i| s.read(i, i)).sum();
+                let trace: f64 = cov.trace();
                 let sq = trace / p as f64;
                 if v {
                     eprint!("done ({:.4}s)  ", t.elapsed().as_secs_f64());
@@ -659,7 +674,8 @@ impl SparsePCA {
         // P2.B: preserve the pre-σ̂²-rescale eigenvalues alongside the
         // rescaled ones. The rescaled version is what existing consumers see.
         let s_eigenvalues_unrescaled: Vec<f64> = s_eigenvalues.clone();
-        let s = Mat::from_fn(p, p, |i, j| s.read(i, j) / sigma_sq);
+        let mut cov = cov;
+        cov.scale(1.0 / sigma_sq);
         let s_eigenvalues: Vec<f64> = s_eigenvalues.iter().map(|&e| e / sigma_sq).collect();
 
         // --- Stage 5: RMT thresholding + FISTA start ---
@@ -689,18 +705,18 @@ impl SparsePCA {
             Some(u) => {
                 // s_eigenvalues is ascending (faer); the top m are the last m.
                 let n_above = s_eigenvalues.iter().filter(|&&e| e > lambda_plus).count();
-                let m = n_above.clamp(1, k_max);
+                let m = n_above.clamp(1, k_max).min(u.ncols());
                 let rq: Vec<f64> = (0..m).map(|j| s_eigenvalues[p - 1 - j]).collect();
-                let v_cand = Mat::from_fn(p, m, |i, j| u.read(i, p - 1 - j));
+                let v_cand = Mat::from_fn(p, m, |i, j| u.read(i, j)); // columns already descending
                 (rq, v_cand, n_above)
             }
             None => {
                 if v {
                     eprint!("[RMT/subspace] subspace iteration (k_max={k_max}) ... ");
                 }
-                let v_cand = subspace_iteration(&s, k_max, 100);
+                let v_cand = subspace_iteration(&cov, k_max, 100);
                 // Ritz values θ_j = v_j^T S v_j, descending after Rayleigh–Ritz
-                let sv_cand = mat_mul(&s, &v_cand);
+                let sv_cand = cov.apply(&v_cand);
                 let rq: Vec<f64> = (0..k_max)
                     .map(|j| (0..p).map(|i| v_cand.read(i, j) * sv_cand.read(i, j)).sum())
                     .collect();
@@ -765,25 +781,28 @@ impl SparsePCA {
                 }
             })
             .sum();
-        let run = |lambda: f64, verbose: bool| {
+        let run = |start: &Mat<f64>, lambda: f64, tol_factor: f64, verbose: bool| {
             fista_sparse_pca(
-                &s,
-                &v_init,
+                &cov,
+                start,
                 gamma,
                 lambda,
                 self.config.max_iterations,
-                self.config.tolerance,
-                self.config.tol_obj,
+                self.config.tolerance * tol_factor,
+                self.config.tol_obj * tol_factor,
                 verbose,
                 self.config.fista_reuse_products,
             )
         };
         let (lambda, lambda_star) = match (self.config.auto_penalty, self.config.lambda_frac) {
             (Some(scale), _) => {
-                let star = select_penalty_eq8(
-                    |lam| subspace_distance(&run(lam, false), &v_init),
+                let tf = self.config.eq8_search_tol_factor;
+                let star = select_penalty_eq8_warm(
+                    |lam, start| run(start.unwrap_or(&v_init), lam, tf, false),
+                    |w| subspace_distance(w, &v_init),
                     target_distance,
                     lambda_plus,
+                    self.config.eq8_warm_start,
                     v,
                 );
                 (scale * star, Some(star))
@@ -797,7 +816,7 @@ impl SparsePCA {
             self.config.tolerance, self.config.tol_obj);
         }
         let t = Instant::now();
-        let components = run(lambda, v);
+        let components = run(&v_init, lambda, 1.0, v);
         let subspace_distance = subspace_distance(&components, &v_init);
         let singletons = (0..k)
             .filter(|&j| {
@@ -1009,7 +1028,7 @@ pub fn biwhitening_collapse(c: &[f64], d: &[f64]) -> (usize, f64) {
 /// getting stuck when rotational ambiguity keeps ‖ΔW‖ large).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn fista_sparse_pca(
-    s: &Mat<f64>,
+    s: &impl Cov,
     v_init: &Mat<f64>,
     gamma: f64,
     lambda: f64,
@@ -1025,7 +1044,7 @@ pub(crate) fn fista_sparse_pca(
     let mut t = 1.0_f64;
 
     // S·W for the current W; with `reuse_products` also S·Y (see FistaConfig).
-    let mut sw = mat_mul(s, v_init);
+    let mut sw = s.apply(v_init);
     let mut obj_prev = trace_with(v_init, &sw);
     let mut sy_next = sw.clone();
 
@@ -1037,25 +1056,19 @@ pub(crate) fn fista_sparse_pca(
         let sy = if reuse_products {
             sy_next
         } else {
-            mat_mul(s, &y)
+            s.apply(&y)
         };
-        let mut z = Mat::from_fn(p, k, |i, j| y.read(i, j) + 2.0 * gamma * sy.read(i, j));
-
         // Step 2: soft-threshold (proximal operator of λ‖·‖₁)
         // threshold = γλ; entries with |z_ij| ≤ γλ are zeroed out.
-        for i in 0..p {
-            for j in 0..k {
-                let v = z.read(i, j);
-                let shrunk = v.abs() - lambda * gamma;
-                z.as_mut().write(
-                    i,
-                    j,
-                    if shrunk > 0.0 {
-                        shrunk * v.signum()
-                    } else {
-                        0.0
-                    },
-                );
+        // Both steps fused in one pass over column slices.
+        let (g2, thr) = (2.0 * gamma, lambda * gamma);
+        let mut z = Mat::<f64>::zeros(p, k);
+        for j in 0..k {
+            let (yj, sj) = (y.col_as_slice(j), sy.col_as_slice(j));
+            for ((zi, &yi), &si) in z.col_as_slice_mut(j).iter_mut().zip(yj).zip(sj) {
+                let v = yi + g2 * si;
+                let shrunk = v.abs() - thr;
+                *zi = if shrunk > 0.0 { shrunk * v.signum() } else { 0.0 };
             }
         }
 
@@ -1063,9 +1076,9 @@ pub(crate) fn fista_sparse_pca(
         z = orthonormalize(&z);
 
         // Stopping criteria
-        let sz = mat_mul(s, &z);
+        let sz = s.apply(&z);
         let obj_new = trace_with(&z, &sz);
-        let dw = frobenius_diff(&z, &prev_w, p, k);
+        let dw = frobenius_diff(&z, &prev_w);
         let dvar = (obj_new - obj_prev).abs();
         let iterate_ok = dw < tol;
         let obj_ok = dvar / (obj_prev.abs() + 1e-10) < tol_obj;
@@ -1101,14 +1114,10 @@ pub(crate) fn fista_sparse_pca(
         // and preserve the O(1/k²) convergence guarantee.
         let next_t = (1.0 / 20.0 + (1.0 + 4.0 * t * t).sqrt()) / 2.0;
         let beta = (t - 1.0) / next_t;
-        y = Mat::from_fn(p, k, |i, j| {
-            z.read(i, j) + beta * (z.read(i, j) - prev_w.read(i, j))
-        });
+        y = extrapolate(&z, &prev_w, beta);
         // S·Y by linearity from S·Z and S·W_prev (only used with reuse_products)
         sy_next = if reuse_products {
-            Mat::from_fn(p, k, |i, j| {
-                sz.read(i, j) + beta * (sz.read(i, j) - s_prev_w.read(i, j))
-            })
+            extrapolate(&sz, &s_prev_w, beta)
         } else {
             Mat::new()
         };
@@ -1124,12 +1133,8 @@ pub(crate) fn fista_sparse_pca(
 /// orthonormal columns), σ_j the singular values of WᵀV. Since Σ σ_j² = ‖WᵀV‖_F²
 /// this needs no SVD. 0 when W spans V; each column of W orthogonal to V adds 1.
 pub fn subspace_distance(w: &Mat<f64>, v: &Mat<f64>) -> f64 {
-    let z = w.as_ref().transpose() * v.as_ref();
-    let fro2: f64 = (0..z.nrows())
-        .flat_map(|i| (0..z.ncols()).map(move |j| (i, j)))
-        .map(|(i, j)| z.read(i, j).powi(2))
-        .sum();
-    w.ncols() as f64 - fro2
+    let z: Mat<f64> = w.as_ref().transpose() * v.as_ref();
+    w.ncols() as f64 - z.squared_norm_l2()
 }
 
 /// Eq. 8 penalty selection (paper's `_adjust_penalty`): the λ* at which
@@ -1144,18 +1149,63 @@ pub fn select_penalty_eq8<F: Fn(f64) -> f64>(
     lambda_plus: f64,
     verbose: bool,
 ) -> f64 {
+    // distance-only interface: no warm start (the 1×1 "solution" just carries the distance)
+    select_penalty_eq8_warm(
+        |lam, _| Mat::from_fn(1, 1, |_, _| distance(lam)),
+        |w| w.read(0, 0),
+        target,
+        lambda_plus,
+        false,
+        verbose,
+    )
+}
+
+/// Eq. 8 root search with warm starts. `fit(λ, start)` returns the sparse solution at λ (from
+/// `start` when given), `dist` its subspace distance to the eigenvectors. The root of
+/// dist(λ) − target is bracketed as before (λ ∈ [1e-4, λ+], doubling up to 64 λ+), then located
+/// in log λ by the Illinois method (regula falsi with the stale endpoint damped), which needs
+/// 4-6 evaluations where plain bisection to the same 5 % precision needs 8-10. With `warm`, each
+/// evaluation starts from the solution at the largest λ known to lie below the root, i.e. the
+/// nearest denser solution, never from a collapsed one above it.
+pub fn select_penalty_eq8_warm<Fit, Dist>(
+    mut fit: Fit,
+    dist: Dist,
+    target: f64,
+    lambda_plus: f64,
+    warm: bool,
+    verbose: bool,
+) -> f64
+where
+    Fit: FnMut(f64, Option<&Mat<f64>>) -> Mat<f64>,
+    Dist: Fn(&Mat<f64>) -> f64,
+{
+    let mut below: Option<(f64, Mat<f64>)> = None;
     let mut evals = 0usize;
-    let mut f = |lam: f64| {
-        let d = distance(lam) - target;
+    let mut f = |lam: f64| -> f64 {
+        let start = if warm {
+            below.as_ref().filter(|(l, _)| *l <= lam).map(|(_, w)| w)
+        } else {
+            None
+        };
+        let warmed = start.is_some();
+        let w = fit(lam, start);
+        let d = dist(&w) - target;
         evals += 1;
         if verbose {
-            eprintln!("[Eq. 8]        eval {evals:>2}  λ = {lam:.4e}  distance − target = {d:+.4}");
+            eprintln!(
+                "[Eq. 8]        eval {evals:>2}  λ = {lam:.4e}  distance − target = {d:+.4}{}",
+                if warmed { "  (warm)" } else { "" }
+            );
+        }
+        if d < 0.0 && below.as_ref().map_or(true, |(l, _)| lam > *l) {
+            below = Some((lam, w));
         }
         d
     };
-    let mut lo = 1e-4_f64;
+    let lo = 1e-4_f64;
     let mut hi = lambda_plus.max(1e-3);
-    if f(lo) >= 0.0 {
+    let f_lo = f(lo);
+    if f_lo >= 0.0 {
         if verbose {
             eprintln!("[Eq. 8]        distance already at/above target at λ = {lo:.1e}; using it");
         }
@@ -1172,27 +1222,168 @@ pub fn select_penalty_eq8<F: Fn(f64) -> f64>(
         }
         return hi;
     }
-    while hi / lo > 1.05 {
-        let mid = (lo * hi).sqrt();
-        if f(mid) < 0.0 {
-            lo = mid;
+    // Illinois in u = ln λ on the bracket [a, b] with f(a) < 0 < f(b)
+    let (mut a, mut b, mut fa, mut fb) = (lo.ln(), hi.ln(), f_lo, f_hi);
+    let mut side = 0i8;
+    while b - a > 1.05_f64.ln() {
+        let mut c = b - fb * (b - a) / (fb - fa);
+        let margin = 0.05 * (b - a);
+        if !c.is_finite() || !(c > a + margin && c < b - margin) {
+            c = 0.5 * (a + b); // secant point useless (cliff-like f): bisect
+        }
+        let fc = f(c.exp());
+        if fc < 0.0 {
+            a = c;
+            fa = fc;
+            if side == -1 {
+                fb *= 0.5;
+            }
+            side = -1;
         } else {
-            hi = mid;
+            b = c;
+            fb = fc;
+            if side == 1 {
+                fa *= 0.5;
+            }
+            side = 1;
         }
     }
-    (lo * hi).sqrt()
+    (0.5 * (a + b)).exp()
 }
 
-/// Tr(W^T S W) — total variance explained by loading matrix W, given SW.
-fn trace_with(w: &Mat<f64>, sw: &Mat<f64>) -> f64 {
-    let (p, k) = (w.nrows(), w.ncols());
-    let mut acc = 0.0_f64;
-    for i in 0..p {
-        for j in 0..k {
-            acc += w.read(i, j) * sw.read(i, j);
+
+/// The covariance S applied to p×k blocks. Dense S, or S = inv·XᵀX kept factored (cell space,
+/// n < p): S z = inv·Xᵀ(X z) costs 2npk instead of p²k and S is never formed.
+pub(crate) trait Cov {
+    fn p(&self) -> usize;
+    fn apply(&self, z: &Mat<f64>) -> Mat<f64>;
+}
+
+impl Cov for Mat<f64> {
+    fn p(&self) -> usize {
+        self.nrows()
+    }
+    fn apply(&self, z: &Mat<f64>) -> Mat<f64> {
+        self.as_ref() * z.as_ref()
+    }
+}
+
+pub(crate) enum CovOp {
+    Dense(Mat<f64>),
+    Factor { x: Mat<f64>, inv: f64 },
+}
+
+impl Cov for CovOp {
+    fn p(&self) -> usize {
+        match self {
+            CovOp::Dense(s) => s.nrows(),
+            CovOp::Factor { x, .. } => x.ncols(),
         }
     }
-    acc
+    fn apply(&self, z: &Mat<f64>) -> Mat<f64> {
+        match self {
+            CovOp::Dense(s) => s.apply(z),
+            CovOp::Factor { x, inv } => {
+                let xz: Mat<f64> = x.as_ref() * z.as_ref();
+                faer::scale(*inv) * (x.as_ref().transpose() * xz.as_ref())
+            }
+        }
+    }
+}
+
+impl CovOp {
+    fn scale(&mut self, f: f64) {
+        match self {
+            CovOp::Dense(s) => *s = Mat::from_fn(s.nrows(), s.ncols(), |i, j| s.read(i, j) * f),
+            CovOp::Factor { inv, .. } => *inv *= f,
+        }
+    }
+
+    fn trace(&self) -> f64 {
+        match self {
+            CovOp::Dense(s) => (0..s.nrows()).map(|i| s.read(i, i)).sum(),
+            CovOp::Factor { x, inv } => {
+                (0..x.ncols())
+                    .map(|j| (0..x.nrows()).map(|i| x.read(i, j).powi(2)).sum::<f64>())
+                    .sum::<f64>()
+                    * inv
+            }
+        }
+    }
+
+    /// Eigenvalues ascending, length p (the factored form pads the p−n exact zeros), and the top
+    /// `m` eigenvectors as columns in descending order. Factored: EVD of the n×n Gram
+    /// G = inv·XXᵀ, then v_j = Xᵀu_j·√(inv/λ_j) (S v = λ v, ‖v‖ = 1).
+    fn full_evd(&self, m: usize) -> (Vec<f64>, Mat<f64>) {
+        match self {
+            CovOp::Dense(s) => {
+                let p = s.nrows();
+                let evd = SelfAdjointEigendecomposition::new(s.as_ref(), Side::Lower);
+                let eigs: Vec<f64> = (0..p).map(|i| evd.s().column_vector().read(i)).collect();
+                let u = evd.u();
+                let m = m.min(p);
+                (eigs, Mat::from_fn(p, m, |i, j| u.read(i, p - 1 - j)))
+            }
+            CovOp::Factor { x, inv } => {
+                let (n, p) = (x.nrows(), x.ncols());
+                let g: Mat<f64> = x.as_ref() * x.as_ref().transpose();
+                let g = Mat::from_fn(n, n, |i, j| g.read(i, j) * inv);
+                let evd = SelfAdjointEigendecomposition::new(g.as_ref(), Side::Lower);
+                let geigs: Vec<f64> = (0..n).map(|i| evd.s().column_vector().read(i)).collect();
+                let u = evd.u();
+                let m = m.min(n).min(p);
+                let ut = Mat::from_fn(n, m, |i, j| u.read(i, n - 1 - j));
+                let xtu: Mat<f64> = x.as_ref().transpose() * ut.as_ref();
+                let vecs = Mat::from_fn(p, m, |i, j| {
+                    let lam = geigs[n - 1 - j];
+                    if lam > 1e-12 {
+                        xtu.read(i, j) * (inv / lam).sqrt()
+                    } else {
+                        0.0
+                    }
+                });
+                let mut eigs = vec![0.0; p.saturating_sub(n)];
+                eigs.extend(geigs);
+                (eigs, vecs)
+            }
+        }
+    }
+}
+
+fn trace_with(w: &Mat<f64>, sw: &Mat<f64>) -> f64 {
+    (0..w.ncols())
+        .map(|j| dot(w.col_as_slice(j), sw.col_as_slice(j)))
+        .sum()
+}
+
+/// Σ a_i b_i with 8 independent accumulators so the reduction vectorises
+/// (summation order differs from a serial loop only by reassociation).
+fn dot(a: &[f64], b: &[f64]) -> f64 {
+    let mut acc = [0.0_f64; 8];
+    let (ca, cb) = (a.chunks_exact(8), b.chunks_exact(8));
+    let (ra, rb) = (ca.remainder(), cb.remainder());
+    for (xa, xb) in ca.zip(cb) {
+        for l in 0..8 {
+            acc[l] += xa[l] * xb[l];
+        }
+    }
+    acc.iter().sum::<f64>() + ra.iter().zip(rb).map(|(x, y)| x * y).sum::<f64>()
+}
+
+/// A + β (A − B), elementwise over column slices.
+fn extrapolate(a: &Mat<f64>, b: &Mat<f64>, beta: f64) -> Mat<f64> {
+    let mut out = Mat::<f64>::zeros(a.nrows(), a.ncols());
+    for j in 0..a.ncols() {
+        for ((o, &x), &y) in out
+            .col_as_slice_mut(j)
+            .iter_mut()
+            .zip(a.col_as_slice(j))
+            .zip(b.col_as_slice(j))
+        {
+            *o = x + beta * (x - y);
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1235,22 +1426,22 @@ fn sample_covariance(x: &Mat<f64>) -> Mat<f64> {
 /// orthogonality constraint in Algorithm 2.
 fn orthonormalize(a: &Mat<f64>) -> Mat<f64> {
     let (p, k) = (a.nrows(), a.ncols());
-    let mut q = a.clone();
+    let mut q = Mat::<f64>::zeros(p, k);
+    let mut v = vec![0.0_f64; p];
     for j in 0..k {
+        v.copy_from_slice(a.col_as_slice(j));
         for jj in 0..j {
-            let dot: f64 = (0..p).map(|i| q.read(i, jj) * q.read(i, j)).sum();
-            for i in 0..p {
-                let v = q.read(i, j) - dot * q.read(i, jj);
-                q.as_mut().write(i, j, v);
+            let u = q.col_as_slice(jj);
+            let d = dot(u, &v);
+            for (vi, &ui) in v.iter_mut().zip(u) {
+                *vi -= d * ui;
             }
         }
-        let norm: f64 = (0..p).map(|i| q.read(i, j).powi(2)).sum::<f64>().sqrt();
+        let norm = dot(&v, &v).sqrt();
         if norm > 1e-14 {
-            for i in 0..p {
-                let v = q.read(i, j) / norm;
-                q.as_mut().write(i, j, v);
-            }
+            v.iter_mut().for_each(|x| *x /= norm);
         }
+        q.col_as_slice_mut(j).copy_from_slice(&v);
     }
     q
 }
@@ -1261,8 +1452,8 @@ fn orthonormalize(a: &Mat<f64>) -> Mat<f64> {
 /// applies S to all k vectors simultaneously (one BLAS gemm), then
 /// orthonormalises.  Used to warm-start FISTA and to compute Rayleigh
 /// quotients for the BBP threshold test.
-fn subspace_iteration(s: &Mat<f64>, k: usize, n_iter: usize) -> Mat<f64> {
-    let p = s.nrows();
+fn subspace_iteration(s: &impl Cov, k: usize, n_iter: usize) -> Mat<f64> {
+    let p = s.p();
     // Deterministic pseudo-random start (xorshift64). The previous start, the
     // first k coordinate vectors, has zero overlap with any signal direction
     // supported outside genes 0..k, so on a block-structured covariance the
@@ -1276,14 +1467,14 @@ fn subspace_iteration(s: &Mat<f64>, k: usize, n_iter: usize) -> Mat<f64> {
         (state >> 11) as f64 / (1u64 << 53) as f64 - 0.5
     });
     for _ in 0..n_iter {
-        let sv = mat_mul(s, &v);
+        let sv = s.apply(&v);
         v = orthonormalize(&sv);
     }
     // Rayleigh–Ritz: rotate within span(V) to the eigenvectors of VᵀSV, so the
     // columns are the best approximations the subspace holds and their Ritz
     // values come out in descending order (plain iteration leaves the slowly
     // converging tail mixed and unordered).
-    let h: Mat<f64> = v.as_ref().transpose() * mat_mul(s, &v).as_ref();
+    let h: Mat<f64> = v.as_ref().transpose() * s.apply(&v).as_ref();
     let evd = SelfAdjointEigendecomposition::new(h.as_ref(), Side::Lower);
     let q = evd.u();
     // faer's eigenvalues are ascending: reverse the columns of Q
@@ -1292,9 +1483,20 @@ fn subspace_iteration(s: &Mat<f64>, k: usize, n_iter: usize) -> Mat<f64> {
 }
 
 /// Frobenius distance ‖A − B‖_F, used for the iterate-change stopping test.
-fn frobenius_diff(a: &Mat<f64>, b: &Mat<f64>, p: usize, k: usize) -> f64 {
-    (0..p)
-        .flat_map(|i| (0..k).map(move |j| (a.read(i, j) - b.read(i, j)).powi(2)))
+fn frobenius_diff(a: &Mat<f64>, b: &Mat<f64>) -> f64 {
+    let k = a.ncols();
+    (0..k)
+        .map(|j| {
+            let (ca, cb) = (a.col_as_slice(j).chunks_exact(8), b.col_as_slice(j).chunks_exact(8));
+            let (ra, rb) = (ca.remainder(), cb.remainder());
+            let mut acc = [0.0_f64; 8];
+            for (xa, xb) in ca.zip(cb) {
+                for l in 0..8 {
+                    acc[l] += (xa[l] - xb[l]).powi(2);
+                }
+            }
+            acc.iter().sum::<f64>() + ra.iter().zip(rb).map(|(x, y)| (x - y).powi(2)).sum::<f64>()
+        })
         .sum::<f64>()
         .sqrt()
 }
