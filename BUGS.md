@@ -39,3 +39,65 @@ to GCC 7 while `g++` is GCC 11, builds that pass `-fstack-clash-protection`
 (e.g. extension modules of a uv-managed Python) fail; set `CC=gcc CXX=g++`.
 The `sc_spca` binary built here links libpython3.12 and glibc 2.38+, so it does
 not run on Ubuntu 22.04 hosts; build there instead.
+
+## σ² bulk median: outliers in or out (design difference vs the reference, 2026-10-19)
+
+**What.** `spca.rs` (`Full` and `Subsample`) estimates the noise scale as
+median(bulk) / MP median with `bulk = eigenvalues in (0.001, λ+]`, i.e. the k
+outliers are dropped first. Chardès' reference (`biwhitening_fast` →
+`_get_scaling_marchenko_pastur`, vchz/spcarmt c6a125b) takes the median of
+*all* n non-zero eigenvalues (of the uncentred Sinkhorn matrix). Everything
+else is identical: on 821 Ex nuclei × 9,218 promoters of the C. elegans
+multiome (ATAC promoter counts) the Sinkhorn factors of the two
+implementations agree to corr(log c) = corr(log d) = 1.00000 and the
+unrescaled spectra are the same (51 eigenvalues above (1 + √q)²).
+
+**Consequence.** σ² = 0.892 (port) vs 0.928 (reference) on those nuclei; the
+ATAC spectrum has ~16 eigenvalues within ±2 % of the edge, so k = 98 vs 80
+(reference's rule applied to the port's spectrum: 79; the last 1 is centred
+vs uncentred). Negligible when k/n is small (RNA, paul15: ~2 %), large for
+ATAC-like data (6 %). Neither rule is unbiased once spikes are present: in the
+`sigma_sq_bulk_median_estimators` test (30 strong spikes planted in 300 × 900
+unit noise) the all-eigenvalues median overestimates σ² by 5–8 %, the
+below-edge median underestimates it by 0.2–3.5 %; with no spikes both give
+the same value. An order-statistics argument that the reference's rule is
+unbiased (because outliers sit above the median) is wrong: interlacing lifts
+the bulk eigenvalues as well. The real lesson is that k is ill-conditioned
+on such spectra (~4 components per 1 % of σ²); the cross-fit null at the
+subspace level is the robust quantity.
+
+**Done.** `FistaConfig::sigma_bulk_all` / `sc_spca --sigma-bulk-all`
+reproduces the reference's rule (79–80 vs 80 on the nuclei above); the default
+is unchanged. Scripts: `~/phd/quivers/celegans/scripts/13_spike_sigma.py`,
+`14_spike_biwhitening.py`; write-up `~/phd/quivers/celegans/spikes/2026-10-19-atac-rank.md`.
+
+**Related.** The agreement gate for using the port instead of Chardès in the
+quivers project (`celegans/PLAN.md`, MP rank within 1) is met in
+`--sigma-bulk-all` mode, which is then a faithful fast implementation of the
+registered method.
+
+## h5ad reader rejects CSR with unsorted column indices (2026-10-20)
+
+**What.** `sc_spca` fails at load time with `cannot read csr matrix: Minor
+indices are not monotonically increasing within each lane` on an `.h5ad`
+whose CSR `X` has unsorted column indices within a row. Such matrices are
+valid CSR and come out of ordinary scipy operations: a sparse product
+(`P @ L.T`, promoter activity from peak counts) and column fancy-indexing
+(`X[:, idx]`) both produce them; `scipy.sparse.csr_matrix.has_sorted_indices`
+is `False` and nothing in scipy or anndata warns. The refusal is in the
+`anndata-hdf5` reader (rmt-spca-io), not in this crate.
+
+**Consequence.** A caller gets a hard failure on some matrices and not on
+others from the same pipeline (Exx's promoter matrix happened to be sorted,
+Exxx's not), which looked like a non-deterministic crash until stderr was
+captured. Cost ~2 h on the C. elegans agreement gate (2026-10-20).
+
+**Workaround.** `X.sort_indices()` before `write_h5ad`
+(`~/phd/quivers/celegans/scripts/16_gate_port_vs_chardes.py::port_fit`).
+
+**Fixed (rmt-spca-io 2d87b26, 2026-10-20).** CSR `X` is now read straight
+from HDF5 (`RawCsr` in `src/reader.rs`), bypassing anndata 0.3, whose row
+slicing also `unwrap()`-panicked on such files under `--stream-block`. Lanes
+are sorted on load and duplicates summed; all three loaders (dense, `--sparse`,
+`--stream-block`) go through it. Test: `raw_csr_tests::unsorted_lanes_load`.
+The `sort_indices()` workaround is no longer needed.
