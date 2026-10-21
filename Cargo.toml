@@ -2,6 +2,7 @@
 name = "rmt-spca"
 version = "0.1.1"
 edition = "2021"
+rust-version = "1.88"
 description = "RMT-guided Sparse PCA for single-cell RNA-seq: biwhitening, Marchenko-Pastur thresholding, and FISTA sparse components"
 license = "GPL-3.0-only"
 repository = "https://github.com/btraven00/rmt-spca"
@@ -12,6 +13,9 @@ exclude = [
     "test_vectors/",
     "scripts/",
     "docs/",
+    "AGENTS.md",
+    "BUGS.md",
+    "PLAN.md",
 ]
 
 [dependencies]
