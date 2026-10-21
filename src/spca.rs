@@ -379,12 +379,19 @@ impl SparsePCA {
         // 2n <= p: keep S = XᵀX/(n−1) factored (cell space). S z costs 2npk instead of p²k (a win
         // only below n = p/2) and the eigendecomposition runs on the n×n Gram matrix; nothing changes numerically.
         let cov = if 2 * n <= p {
-            CovOp::Factor { x: xwc, inv: 1.0 / (n - 1) as f64 }
+            CovOp::Factor {
+                x: xwc,
+                inv: 1.0 / (n - 1) as f64,
+            }
         } else {
             CovOp::Dense(sample_covariance(&xwc))
         };
         if v {
-            eprint!("done ({:.2}s{})  ", t.elapsed().as_secs_f64(), if 2 * n <= p { ", factored, 2n<=p" } else { "" });
+            eprint!(
+                "done ({:.2}s{})  ",
+                t.elapsed().as_secs_f64(),
+                if 2 * n <= p { ", factored, 2n<=p" } else { "" }
+            );
         }
         self.decompose(Front {
             cov,
@@ -523,12 +530,19 @@ impl SparsePCA {
         let cov = if 2 * n <= p {
             let mu = data.biwhitened_mean(&xt, &c, &d);
             let rows: Vec<usize> = (0..n).collect();
-            CovOp::Factor { x: data.centred_rows(&rows, &c, &d, &mu), inv: 1.0 / (n - 1) as f64 }
+            CovOp::Factor {
+                x: data.centred_rows(&rows, &c, &d, &mu),
+                inv: 1.0 / (n - 1) as f64,
+            }
         } else {
             CovOp::Dense(data.biwhitened_covariance(&xt, &c, &d))
         };
         if v {
-            eprint!("done ({:.2}s{})  ", t.elapsed().as_secs_f64(), if 2 * n <= p { ", factored, 2n<=p" } else { "" });
+            eprint!(
+                "done ({:.2}s{})  ",
+                t.elapsed().as_secs_f64(),
+                if 2 * n <= p { ", factored, 2n<=p" } else { "" }
+            );
         }
         let sub_spectrum = self.subsample_rows(n).map(|rows| {
             let mu = data.biwhitened_mean(&xt, &c, &d);
@@ -592,7 +606,13 @@ impl SparsePCA {
         let (sigma_sq, s_eigenvalues): (f64, Vec<f64>) = match self.config.eigensolver {
             EigensolverMode::Full => {
                 if v {
-                    eprint!("[eigenspectrum] full EVD ({}) ... ", match &cov { CovOp::Dense(_) => format!("{p}×{p}"), CovOp::Factor { .. } => format!("Gram {n}×{n}") });
+                    eprint!(
+                        "[eigenspectrum] full EVD ({}) ... ",
+                        match &cov {
+                            CovOp::Dense(_) => format!("{p}×{p}"),
+                            CovOp::Factor { .. } => format!("Gram {n}×{n}"),
+                        }
+                    );
                 }
                 let t = Instant::now();
                 // eigenvalues ascending (length p), top-m eigenvectors as columns, descending
@@ -1062,11 +1082,7 @@ pub(crate) fn fista_sparse_pca(
         let s_prev_w = sw;
 
         // Step 1: gradient ascent  Z = Y + 2γ S Y
-        let sy = if reuse_products {
-            sy_next
-        } else {
-            s.apply(&y)
-        };
+        let sy = if reuse_products { sy_next } else { s.apply(&y) };
         // Step 2: soft-threshold (proximal operator of λ‖·‖₁)
         // threshold = γλ; entries with |z_ij| ≤ γλ are zeroed out.
         // Both steps fused in one pass over column slices.
@@ -1077,7 +1093,11 @@ pub(crate) fn fista_sparse_pca(
             for ((zi, &yi), &si) in z.col_as_slice_mut(j).iter_mut().zip(yj).zip(sj) {
                 let v = yi + g2 * si;
                 let shrunk = v.abs() - thr;
-                *zi = if shrunk > 0.0 { shrunk * v.signum() } else { 0.0 };
+                *zi = if shrunk > 0.0 {
+                    shrunk * v.signum()
+                } else {
+                    0.0
+                };
             }
         }
 
@@ -1206,7 +1226,7 @@ where
                 if warmed { "  (warm)" } else { "" }
             );
         }
-        if d < 0.0 && below.as_ref().map_or(true, |(l, _)| lam > *l) {
+        if d < 0.0 && below.as_ref().is_none_or(|(l, _)| lam > *l) {
             below = Some((lam, w));
         }
         d
@@ -1259,7 +1279,6 @@ where
     }
     (0.5 * (a + b)).exp()
 }
-
 
 /// The covariance S applied to p×k blocks. Dense S, or S = inv·XᵀX kept factored (cell space,
 /// n < p): S z = inv·Xᵀ(X z) costs 2npk instead of p²k and S is never formed.
@@ -1369,9 +1388,8 @@ fn trace_with(w: &Mat<f64>, sw: &Mat<f64>) -> f64 {
 /// (summation order differs from a serial loop only by reassociation).
 fn dot(a: &[f64], b: &[f64]) -> f64 {
     let mut acc = [0.0_f64; 8];
-    let (ca, cb) = (a.chunks_exact(8), b.chunks_exact(8));
-    let (ra, rb) = (ca.remainder(), cb.remainder());
-    for (xa, xb) in ca.zip(cb) {
+    let ((ca, ra), (cb, rb)) = (a.as_chunks::<8>(), b.as_chunks::<8>());
+    for (xa, xb) in ca.iter().zip(cb) {
         for l in 0..8 {
             acc[l] += xa[l] * xb[l];
         }
@@ -1496,10 +1514,12 @@ fn frobenius_diff(a: &Mat<f64>, b: &Mat<f64>) -> f64 {
     let k = a.ncols();
     (0..k)
         .map(|j| {
-            let (ca, cb) = (a.col_as_slice(j).chunks_exact(8), b.col_as_slice(j).chunks_exact(8));
-            let (ra, rb) = (ca.remainder(), cb.remainder());
+            let ((ca, ra), (cb, rb)) = (
+                a.col_as_slice(j).as_chunks::<8>(),
+                b.col_as_slice(j).as_chunks::<8>(),
+            );
             let mut acc = [0.0_f64; 8];
-            for (xa, xb) in ca.zip(cb) {
+            for (xa, xb) in ca.iter().zip(cb) {
                 for l in 0..8 {
                     acc[l] += (xa[l] - xb[l]).powi(2);
                 }
@@ -1890,7 +1910,11 @@ mod tests {
         let loads = Mat::from_fn(k, p, |_, _| gauss() / (p as f64).sqrt());
         for strength in [0.0, 1.5, 3.0, 6.0] {
             let x = Mat::from_fn(n, p, |i, j| {
-                noise.read(i, j) + strength * (0..k).map(|c| scores.read(i, c) * loads.read(c, j)).sum::<f64>()
+                noise.read(i, j)
+                    + strength
+                        * (0..k)
+                            .map(|c| scores.read(i, c) * loads.read(c, j))
+                            .sum::<f64>()
             });
             let run = |all: bool| {
                 SparsePCA::new(FistaConfig {
@@ -1913,7 +1937,12 @@ mod tests {
                 assert!((all.sigma_sq - 1.0).abs() < 0.05 && (below.sigma_sq - 1.0).abs() < 0.05);
                 assert_eq!(all.sigma_sq, below.sigma_sq);
             } else {
-                assert!(all.sigma_sq > below.sigma_sq, "all {} below {}", all.sigma_sq, below.sigma_sq);
+                assert!(
+                    all.sigma_sq > below.sigma_sq,
+                    "all {} below {}",
+                    all.sigma_sq,
+                    below.sigma_sq
+                );
             }
         }
     }
